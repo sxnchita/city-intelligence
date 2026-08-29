@@ -2,86 +2,147 @@ const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ||
   "http://localhost:8000";
 
-export type CameraStatus =
-  | "online"
-  | "offline"
-  | "degraded";
+// =====================================
+// GEOJSON TYPES
+// =====================================
 
-export type Camera = {
+export type Position = [number, number];
+
+export type GeoJSONPointGeometry = {
+  type: "Point";
+  coordinates: Position;
+};
+
+export type GeoJSONLineStringGeometry = {
+  type: "LineString";
+  coordinates: Position[];
+};
+
+export type GeoJSONFeature<
+  TGeometry,
+  TProperties
+> = {
+  type: "Feature";
+  geometry: TGeometry;
+  properties: TProperties;
+};
+
+export type GeoJSONFeatureCollection<
+  TFeature
+> = {
+  type: "FeatureCollection";
+  features: TFeature[];
+};
+
+// =====================================
+// CAMERA TYPES
+// =====================================
+
+export type CameraProperties = {
   camera_id: string;
   name: string;
-  latitude: number;
-  longitude: number;
-  road_id?: string;
-  road_name?: string;
-  direction?: string;
-  status: CameraStatus;
+  heading: number;
+  zone: string;
+  last_seen_at: string;
 };
 
-export type TrajectorySegmentType =
-  | "confirmed"
-  | "inferred"
-  | "gap";
+export type CameraFeature =
+  GeoJSONFeature<
+    GeoJSONPointGeometry,
+    CameraProperties
+  >;
 
-export type TrajectorySegment = {
-  segment_id: string;
-  from_camera_id: string;
-  to_camera_id: string;
-  type: TrajectorySegmentType;
-  confidence: number;
+export type CameraCollection =
+  GeoJSONFeatureCollection<CameraFeature>;
 
-  geometry: {
-    type: "LineString";
-    coordinates: [number, number][];
-  };
-};
+// =====================================
+// TRAJECTORY TYPES
+// =====================================
 
-export type TrajectoryObservation = {
-  observation_id: string;
+export type TrajectoryPointProperties = {
+  feature_type: "sighting";
+
   camera_id: string;
   timestamp: string;
 
-  latitude: number;
-  longitude: number;
-
-  confidence: number;
+  confidence?: number;
+  sequence?: number;
 };
 
-export type TrajectoryResponse = {
-  vehicle_id: string;
-  plate: string;
+export type TrajectoryLineProperties = {
+  feature_type: "hop";
 
-  observations: TrajectoryObservation[];
+  from_camera_id?: string;
+  to_camera_id?: string;
 
-  segments: TrajectorySegment[];
+  link_confidence: number;
+
+  skipped_cameras: string[];
+
+  detour_suspected: boolean;
+
+  sequence?: number;
 };
 
-export type HeatmapFeature = {
-  type: "Feature";
+export type TrajectoryPointFeature =
+  GeoJSONFeature<
+    GeoJSONPointGeometry,
+    TrajectoryPointProperties
+  >;
 
-  geometry: {
-    type: "Point";
-    coordinates: [number, number];
-  };
+export type TrajectoryLineFeature =
+  GeoJSONFeature<
+    GeoJSONLineStringGeometry,
+    TrajectoryLineProperties
+  >;
 
-  properties: {
-    density: number;
-    vehicle_count?: number;
-  };
+export type TrajectoryFeature =
+  | TrajectoryPointFeature
+  | TrajectoryLineFeature;
+
+export type TrajectoryCollection =
+  GeoJSONFeatureCollection<TrajectoryFeature>;
+
+// =====================================
+// TRAFFIC / HEATMAP TYPES
+// =====================================
+
+export type CongestionBand =
+  | "normal"
+  | "moderate"
+  | "heavy"
+  | "severe";
+
+export type TrafficProperties = {
+  road_id?: string;
+  road_name?: string;
+
+  weight: number;
+
+  normalized: number;
+
+  congestion_band: CongestionBand;
+
+  sample_count: number;
 };
 
-export type HeatmapResponse = {
-  type: "FeatureCollection";
-  features: HeatmapFeature[];
-};
+export type TrafficFeature =
+  GeoJSONFeature<
+    GeoJSONLineStringGeometry,
+    TrafficProperties
+  >;
 
-// ---------------------------------
+export type TrafficCollection =
+  GeoJSONFeatureCollection<TrafficFeature>;
+
+// =====================================
 // CAMERAS
-// ---------------------------------
+// GET /api/v1/cameras
+// =====================================
 
-export async function getCameras(): Promise<Camera[]> {
+export async function getCameras(): Promise<CameraCollection> {
   const response = await fetch(
-    `${API_BASE_URL}/api/cameras`
+    `${API_BASE_URL}/api/v1/cameras`
   );
 
   if (!response.ok) {
@@ -90,23 +151,21 @@ export async function getCameras(): Promise<Camera[]> {
     );
   }
 
-  const data = await response.json();
-
-  return data.cameras;
+  return response.json();
 }
 
-// ---------------------------------
-// TRAJECTORY
-// ---------------------------------
+// =====================================
+// VEHICLE TRAJECTORY
+// GET /api/v1/vehicles/{id}/trajectory
+// =====================================
 
-export async function getTrajectory(
-  plate: string,
+export async function getVehicleTrajectory(
+  vehicleId: string,
   from?: string,
   to?: string
-): Promise<TrajectoryResponse> {
-  const params = new URLSearchParams();
-
-  params.set("plate", plate);
+): Promise<TrajectoryCollection> {
+  const params =
+    new URLSearchParams();
 
   if (from) {
     params.set("from", from);
@@ -116,8 +175,15 @@ export async function getTrajectory(
     params.set("to", to);
   }
 
+  const query =
+    params.toString()
+      ? `?${params.toString()}`
+      : "";
+
   const response = await fetch(
-    `${API_BASE_URL}/api/trajectory?${params.toString()}`
+    `${API_BASE_URL}/api/v1/vehicles/${encodeURIComponent(
+      vehicleId
+    )}/trajectory${query}`
   );
 
   if (!response.ok) {
@@ -129,36 +195,28 @@ export async function getTrajectory(
   return response.json();
 }
 
-// ---------------------------------
-// HEATMAP
-// ---------------------------------
+// =====================================
+// TRAFFIC HEATMAP
+// GET /api/v1/analytics/heatmap
+// =====================================
 
-export async function getHeatmap(
-  from?: string,
-  to?: string
-): Promise<HeatmapResponse> {
-  const params = new URLSearchParams();
+export async function getTrafficHeatmap(
+  from: string,
+  to: string
+): Promise<TrafficCollection> {
+  const params =
+    new URLSearchParams();
 
-  if (from) {
-    params.set("from", from);
-  }
-
-  if (to) {
-    params.set("to", to);
-  }
-
-  const query =
-    params.toString().length > 0
-      ? `?${params.toString()}`
-      : "";
+  params.set("from", from);
+  params.set("to", to);
 
   const response = await fetch(
-    `${API_BASE_URL}/api/analytics/heatmap${query}`
+    `${API_BASE_URL}/api/v1/analytics/heatmap?${params.toString()}`
   );
 
   if (!response.ok) {
     throw new Error(
-      `Failed to fetch heatmap: ${response.status}`
+      `Failed to fetch traffic heatmap: ${response.status}`
     );
   }
 

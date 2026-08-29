@@ -1,893 +1,1063 @@
 import { useEffect, useRef, useState } from "react";
+import L, {
+  GeoJSON,
+  Map as LeafletMap,
+  PathOptions,
+} from "leaflet";
 
-import {
-  Map,
-  Marker,
-  NavigationControl,
-  Popup,
-  GeoJSONSource,
-  setWorkerUrl,
-} from "maplibre-gl";
-
-import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
-
-import "maplibre-gl/dist/maplibre-gl.css";
-
-import { mockCameras } from "../../data/mockCameras";
-import { mockTrajectory } from "../../data/mockTrajectory";
-import { mockHeatmap } from "../../data/mockHeatmap";
+import "leaflet/dist/leaflet.css";
 
 import {
   getCameras,
-  getTrajectory,
-  getHeatmap,
+  getTrafficHeatmap,
+  getVehicleTrajectory,
+  type CameraCollection,
+  type CameraFeature,
+  type TrafficCollection,
+  type TrafficFeature,
+  type TrajectoryCollection,
+  type TrajectoryFeature,
+  type TrajectoryLineFeature,
+  type TrajectoryPointFeature,
 } from "../../services/mapApi";
 
 import {
-  connectLiveSocket,
+  connectLiveStream,
   type LiveEvent,
-} from "../../services/liveSocket";
+} from "../../services/liveStream";
 
 import {
-  startMockLiveUpdates,
-} from "../../services/mockLiveUpdates";
+  mockCameraGeoJson,
+  mockTrajectoryGeoJson,
+  mockTrafficGeoJson,
+} from "../../data/mockBackendGeoJson";
 
-setWorkerUrl(workerUrl);
+const DEFAULT_VEHICLE_ID = "V123";
+const TRAFFIC_REFRESH_MS = 30_000;
+const MIN_TRAFFIC_SAMPLE_COUNT = 10;
 
-export default function CityMap() {
+type CityMapProps = {
+  showCamerasInitially?: boolean;
+  showTrajectoryInitially?: boolean;
+  showTrafficInitially?: boolean;
+};
+
+export default function CityMap({
+  showCamerasInitially = true,
+  showTrajectoryInitially = true,
+  showTrafficInitially = true,
+}: CityMapProps) {
   const mapContainerRef =
     useRef<HTMLDivElement | null>(null);
 
   const mapRef =
-    useRef<Map | null>(null);
+    useRef<LeafletMap | null>(null);
 
-  const [showTrajectory, setShowTrajectory] =
-    useState(true);
+  const cameraLayerRef =
+    useRef<GeoJSON | null>(null);
 
-  const [showHeatmap, setShowHeatmap] =
-    useState(true);
+  const trajectoryLayerRef =
+    useRef<GeoJSON | null>(null);
 
-  const [connectionStatus, setConnectionStatus] =
+  const trafficLayerRef =
+    useRef<GeoJSON | null>(null);
+
+  const [showCameras, setShowCameras] =
+    useState(showCamerasInitially);
+
+  const [
+    showTrajectory,
+    setShowTrajectory,
+  ] = useState(
+    showTrajectoryInitially
+  );
+
+  const [showTraffic, setShowTraffic] =
+    useState(showTrafficInitially);
+
+  const [
+    streamStatus,
+    setStreamStatus,
+  ] = useState<
+    | "connecting"
+    | "connected"
+    | "disconnected"
+  >("connecting");
+
+  const [dataMode, setDataMode] =
     useState<
-      "mock" | "connected" | "disconnected"
-    >("mock");
+      "backend" | "demo"
+    >("demo");
 
-  const [lastLiveUpdate, setLastLiveUpdate] =
-    useState<string>("Waiting...");
+  const [lastEvent, setLastEvent] =
+    useState(
+      "Waiting for live stream"
+    );
+
+  // =====================================
+  // INITIALIZE MAP
+  // =====================================
 
   useEffect(() => {
-    if (!mapContainerRef.current) {
+    const container =
+      mapContainerRef.current;
+
+    if (!container) {
       return;
     }
 
-    // =================================
-    // CREATE MAP
-    // =================================
+    // Prevent duplicate Leaflet map
+    // creation during React StrictMode.
+    if (mapRef.current) {
+      return;
+    }
 
-    const map = new Map({
-      container: mapContainerRef.current,
+    let disposed = false;
 
-      style: {
-        version: 8,
-
-        sources: {
-          osm: {
-            type: "raster",
-
-            tiles: [
-              "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-            ],
-
-            tileSize: 256,
-
-            attribution:
-              "© OpenStreetMap contributors",
-          },
-        },
-
-        layers: [
-          {
-            id: "osm-base",
-            type: "raster",
-            source: "osm",
-          },
-        ],
-      },
-
-      center: [77.215, 28.63],
-
-      zoom: 12,
-    });
+    const map = L.map(
+      container,
+      {
+        zoomControl: true,
+        attributionControl: true,
+      }
+    ).setView(
+      [28.63, 77.215],
+      12
+    );
 
     mapRef.current = map;
 
-    map.addControl(
-      new NavigationControl(),
-      "top-right"
-    );
+    // =====================================
+    // BASEMAP
+    // =====================================
 
-    const markers: Marker[] = [];
+    L.tileLayer(
+      "https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
+      {
+        attribution:
+          '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team',
+        subdomains: "abc",
+        maxZoom: 20,
+      }
+    ).addTo(map);
 
-    let socket: WebSocket | null = null;
+    // =====================================
+    // CAMERA LAYER
+    // =====================================
 
-    let stopMockUpdates:
-      | (() => void)
-      | null = null;
-
-    // =================================
-    // MAP LOAD
-    // =================================
-
-    map.once("load", async () => {
-      console.log("Map loaded");
-
-      // =================================
-      // DEFAULT MOCK DATA
-      // =================================
-
-      let cameras = mockCameras;
-      let trajectory = mockTrajectory;
-      let heatmap = mockHeatmap;
-
-      // =================================
-      // REST: CAMERAS
-      // =================================
-
-      try {
-        const backendCameras =
-          await getCameras();
-
-        cameras =
-          backendCameras.map(
-            (camera) => ({
-              id: camera.camera_id,
-
-              name: camera.name,
-
-              longitude:
-                camera.longitude,
-
-              latitude:
-                camera.latitude,
-
-              status:
-                camera.status,
-            })
-          );
-
-        console.log(
-          "Using backend cameras"
-        );
-      } catch {
-        console.log(
-          "Camera API unavailable. Using mock cameras."
-        );
+    function renderCameraLayer(
+      collection: CameraCollection
+    ) {
+      if (
+        disposed ||
+        !mapRef.current
+      ) {
+        return;
       }
 
-      // =================================
-      // REST: TRAJECTORY
-      // =================================
+      cameraLayerRef.current?.remove();
 
-      try {
-        const backendTrajectory =
-          await getTrajectory(
-            "UP15AB1234"
-          );
+      const layer = L.geoJSON(
+        collection,
+        {
+          pointToLayer: (
+            feature,
+            latlng
+          ) => {
+            const camera =
+              feature as CameraFeature;
 
-        trajectory = {
-          type:
-            "FeatureCollection",
+            const color =
+              getCameraHealthColor(
+                camera.properties
+                  .last_seen_at
+              );
 
-          features:
-            backendTrajectory.segments.map(
-              (segment) => ({
-                type:
-                  "Feature",
+            const heading =
+              camera.properties
+                .heading;
 
-                properties: {
-                  segmentType:
-                    segment.type,
+            const icon =
+              L.divIcon({
+                className:
+                  "camera-marker-wrapper",
 
-                  confidence:
-                    segment.confidence,
-                },
-
-                geometry:
-                  segment.geometry,
-              })
-            ),
-        } as typeof mockTrajectory;
-
-        console.log(
-          "Using backend trajectory"
-        );
-      } catch {
-        console.log(
-          "Trajectory API unavailable. Using mock trajectory."
-        );
-      }
-
-      // =================================
-      // REST: HEATMAP
-      // =================================
-
-      try {
-        const backendHeatmap =
-          await getHeatmap();
-
-        heatmap =
-          backendHeatmap as typeof mockHeatmap;
-
-        console.log(
-          "Using backend heatmap"
-        );
-      } catch {
-        console.log(
-          "Heatmap API unavailable. Using mock heatmap."
-        );
-      }
-
-      // =================================
-      // CAMERA MARKERS
-      // =================================
-
-      cameras.forEach(
-        (camera) => {
-          const marker =
-            new Marker({
-              color:
-                camera.status ===
-                "online"
-                  ? "#22c55e"
-                  : camera.status ===
-                    "degraded"
-                  ? "#f59e0b"
-                  : "#ef4444",
-            })
-              .setLngLat([
-                camera.longitude,
-                camera.latitude,
-              ])
-
-              .setPopup(
-                new Popup({
-                  offset: 25,
-                }).setHTML(`
+                html: `
                   <div
                     style="
-                      font-family: Arial;
-                      min-width: 150px;
+                      width: 28px;
+                      height: 28px;
+                      display: flex;
+                      align-items: center;
+                      justify-content: center;
+                      transform: rotate(${heading}deg);
                     "
                   >
-                    <strong>
-                      ${camera.id}
-                    </strong>
-
-                    <br/>
-
-                    ${camera.name}
-
-                    <br/>
-
-                    Status:
-                    <strong>
-                      ${camera.status}
-                    </strong>
+                    <div
+                      style="
+                        width: 0;
+                        height: 0;
+                        border-left: 8px solid transparent;
+                        border-right: 8px solid transparent;
+                        border-bottom: 18px solid ${color};
+                        filter: drop-shadow(
+                          0 2px 4px rgba(0,0,0,.45)
+                        );
+                      "
+                    ></div>
                   </div>
-                `)
-              )
-
-              .addTo(map);
-
-          markers.push(marker);
-        }
-      );
-
-      // =================================
-      // TRAJECTORY SOURCE
-      // =================================
-
-      map.addSource(
-        "trajectory-data",
-        {
-          type: "geojson",
-          data: trajectory,
-        }
-      );
-
-      // CONFIRMED
-
-      map.addLayer({
-        id:
-          "trajectory-confirmed",
-
-        type: "line",
-
-        source:
-          "trajectory-data",
-
-        filter: [
-          "==",
-
-          ["get", "segmentType"],
-
-          "confirmed",
-        ],
-
-        layout: {
-          "line-join":
-            "round",
-
-          "line-cap":
-            "round",
-        },
-
-        paint: {
-          "line-color":
-            "#2563eb",
-
-          "line-width":
-            8,
-
-          "line-opacity":
-            1,
-        },
-      });
-
-      // INFERRED
-
-      map.addLayer({
-        id:
-          "trajectory-inferred",
-
-        type: "line",
-
-        source:
-          "trajectory-data",
-
-        filter: [
-          "==",
-
-          ["get", "segmentType"],
-
-          "inferred",
-        ],
-
-        layout: {
-          "line-join":
-            "round",
-
-          "line-cap":
-            "round",
-        },
-
-        paint: {
-          "line-color":
-            "#f59e0b",
-
-          "line-width":
-            8,
-
-          "line-opacity":
-            1,
-
-          "line-dasharray": [
-            2,
-            2,
-          ],
-        },
-      });
-
-      // GAP
-
-      map.addLayer({
-        id:
-          "trajectory-gap",
-
-        type: "line",
-
-        source:
-          "trajectory-data",
-
-        filter: [
-          "==",
-
-          ["get", "segmentType"],
-
-          "gap",
-        ],
-
-        layout: {
-          "line-join":
-            "round",
-
-          "line-cap":
-            "round",
-        },
-
-        paint: {
-          "line-color":
-            "#64748b",
-
-          "line-width":
-            7,
-
-          "line-opacity":
-            0.55,
-
-          "line-dasharray": [
-            0.5,
-            2.5,
-          ],
-        },
-      });
-
-      // =================================
-      // HEATMAP SOURCE
-      // =================================
-
-      map.addSource(
-        "heatmap-data",
-        {
-          type: "geojson",
-
-          data: heatmap,
-        }
-      );
-
-      map.addLayer(
-        {
-          id:
-            "traffic-heatmap",
-
-          type:
-            "heatmap",
-
-          source:
-            "heatmap-data",
-
-          paint: {
-            "heatmap-weight": [
-              "interpolate",
-
-              ["linear"],
-
-              ["get", "density"],
-
-              0,
-              0,
-
-              1,
-              1,
-            ],
-
-            "heatmap-intensity":
-              1.5,
-
-            "heatmap-radius":
-              55,
-
-            "heatmap-opacity":
-              0.75,
-
-            "heatmap-color": [
-              "interpolate",
-
-              ["linear"],
-
-              ["heatmap-density"],
-
-              0,
-              "rgba(0,0,255,0)",
-
-              0.2,
-              "royalblue",
-
-              0.4,
-              "cyan",
-
-              0.6,
-              "lime",
-
-              0.8,
-              "yellow",
-
-              1,
-              "red",
-            ],
-          },
-        },
-
-        "trajectory-confirmed"
-      );
-
-      // =================================
-      // REAL WEBSOCKET CONNECTION
-      // =================================
-
-      socket =
-        connectLiveSocket(
-          (event) => {
-            handleLiveEvent(
-              map,
-              event
-            );
-
-            setLastLiveUpdate(
-              event.event
+                `,
+
+                iconSize: [28, 28],
+                iconAnchor: [14, 14],
+              });
+
+            return L.marker(
+              latlng,
+              {
+                icon,
+              }
             );
           },
 
-          () => {
-            console.log(
-              "Live backend connected"
-            );
+          onEachFeature: (
+            feature,
+            layer
+          ) => {
+            const camera =
+              feature as CameraFeature;
 
-            setConnectionStatus(
+            const health =
+              getCameraHealthLabel(
+                camera.properties
+                  .last_seen_at
+              );
+
+            layer.bindPopup(`
+              <div
+                style="
+                  min-width: 190px;
+                  font-family: Arial, sans-serif;
+                  line-height: 1.5;
+                "
+              >
+                <strong style="font-size:14px;">
+                  ${camera.properties.name}
+                </strong>
+
+                <br />
+
+                Camera ID:
+                ${camera.properties.camera_id}
+
+                <br />
+
+                Zone:
+                ${camera.properties.zone}
+
+                <br />
+
+                Heading:
+                ${camera.properties.heading}°
+
+                <br />
+
+                Health:
+                <strong>
+                  ${health}
+                </strong>
+
+                <br />
+
+                Last seen:
+                ${formatDateTime(
+                  camera.properties
+                    .last_seen_at
+                )}
+              </div>
+            `);
+          },
+        }
+      );
+
+      cameraLayerRef.current =
+        layer;
+
+      if (
+        showCamerasInitially &&
+        !disposed
+      ) {
+        layer.addTo(map);
+      }
+    }
+
+    // =====================================
+    // TRAJECTORY LAYER
+    // =====================================
+
+    function renderTrajectoryLayer(
+      collection: TrajectoryCollection
+    ) {
+      if (
+        disposed ||
+        !mapRef.current
+      ) {
+        return;
+      }
+
+      trajectoryLayerRef.current?.remove();
+
+      const layer = L.geoJSON(
+        collection,
+        {
+          style: (
+            feature
+          ): PathOptions => {
+            const item =
+              feature as TrajectoryFeature;
+
+            if (
+              item.geometry.type !==
+              "LineString"
+            ) {
+              return {};
+            }
+
+            return getTrajectoryStyle(
+              item as TrajectoryLineFeature
+            );
+          },
+
+          pointToLayer: (
+            feature,
+            latlng
+          ) => {
+            const point =
+              feature as TrajectoryPointFeature;
+
+            return L.circleMarker(
+              latlng,
+              {
+                radius: 6,
+                color: "#ffffff",
+                weight: 2,
+                fillColor:
+                  "#2563eb",
+                fillOpacity: 1,
+              }
+            );
+          },
+
+          onEachFeature: (
+            feature,
+            layer
+          ) => {
+            const item =
+              feature as TrajectoryFeature;
+
+            if (
+              item.geometry.type ===
+              "Point"
+            ) {
+              const point =
+                item as TrajectoryPointFeature;
+
+              layer.bindPopup(`
+                <div
+                  style="
+                    font-family: Arial, sans-serif;
+                    min-width: 175px;
+                    line-height: 1.5;
+                  "
+                >
+                  <strong>
+                    Vehicle sighting
+                  </strong>
+
+                  <br />
+
+                  Camera:
+                  ${point.properties.camera_id}
+
+                  <br />
+
+                  Time:
+                  ${formatDateTime(
+                    point.properties.timestamp
+                  )}
+
+                  ${
+                    point.properties
+                      .confidence !==
+                    undefined
+                      ? `
+                        <br />
+
+                        Confidence:
+                        ${Math.round(
+                          point.properties
+                            .confidence *
+                            100
+                        )}%
+                      `
+                      : ""
+                  }
+                </div>
+              `);
+            } else {
+              const line =
+                item as TrajectoryLineFeature;
+
+              layer.bindPopup(`
+                <div
+                  style="
+                    font-family: Arial, sans-serif;
+                    min-width: 200px;
+                    line-height: 1.5;
+                  "
+                >
+                  <strong>
+                    Route hop
+                  </strong>
+
+                  <br />
+
+                  Link confidence:
+                  ${Math.round(
+                    line.properties
+                      .link_confidence *
+                      100
+                  )}%
+
+                  <br />
+
+                  Skipped cameras:
+                  ${
+                    line.properties
+                      .skipped_cameras
+                      .length > 0
+                      ? line.properties
+                          .skipped_cameras
+                          .join(", ")
+                      : "None"
+                  }
+
+                  <br />
+
+                  Detour suspected:
+                  ${
+                    line.properties
+                      .detour_suspected
+                      ? "Yes"
+                      : "No"
+                  }
+                </div>
+              `);
+            }
+          },
+        }
+      );
+
+      trajectoryLayerRef.current =
+        layer;
+
+      if (
+        showTrajectoryInitially &&
+        !disposed
+      ) {
+        layer.addTo(map);
+      }
+    }
+
+    // =====================================
+    // TRAFFIC LAYER
+    // =====================================
+
+    function renderTrafficLayer(
+      collection: TrafficCollection
+    ) {
+      if (
+        disposed ||
+        !mapRef.current
+      ) {
+        return;
+      }
+
+      trafficLayerRef.current?.remove();
+
+      const layer = L.geoJSON(
+        collection,
+        {
+          style: (
+            feature
+          ): PathOptions => {
+            return getTrafficStyle(
+              feature as TrafficFeature
+            );
+          },
+
+          onEachFeature: (
+            feature,
+            layer
+          ) => {
+            const traffic =
+              feature as TrafficFeature;
+
+            layer.bindPopup(`
+              <div
+                style="
+                  font-family: Arial, sans-serif;
+                  min-width: 195px;
+                  line-height: 1.5;
+                "
+              >
+                <strong>
+                  ${
+                    traffic.properties
+                      .road_name ||
+                    "Road segment"
+                  }
+                </strong>
+
+                <br />
+
+                Congestion:
+                ${
+                  traffic.properties
+                    .congestion_band
+                }
+
+                <br />
+
+                Normalized:
+                ${traffic.properties.normalized.toFixed(
+                  2
+                )}
+
+                <br />
+
+                Weight:
+                ${traffic.properties.weight}
+
+                <br />
+
+                Samples:
+                ${
+                  traffic.properties
+                    .sample_count
+                }
+              </div>
+            `);
+          },
+        }
+      );
+
+      trafficLayerRef.current =
+        layer;
+
+      if (
+        showTrafficInitially &&
+        !disposed
+      ) {
+        layer.addTo(map);
+      }
+    }
+
+    // =====================================
+    // LOAD CAMERAS
+    // =====================================
+
+    async function loadCameras() {
+      try {
+        const cameras =
+          await getCameras();
+
+        if (disposed) {
+          return;
+        }
+
+        renderCameraLayer(
+          cameras
+        );
+
+        setDataMode(
+          "backend"
+        );
+      } catch {
+        if (disposed) {
+          return;
+        }
+
+        renderCameraLayer(
+          mockCameraGeoJson
+        );
+
+        setDataMode(
+          "demo"
+        );
+      }
+    }
+
+    // =====================================
+    // LOAD TRAJECTORY
+    // =====================================
+
+    async function loadTrajectory() {
+      try {
+        const trajectory =
+          await getVehicleTrajectory(
+            DEFAULT_VEHICLE_ID
+          );
+
+        if (disposed) {
+          return;
+        }
+
+        renderTrajectoryLayer(
+          trajectory
+        );
+      } catch {
+        if (disposed) {
+          return;
+        }
+
+        renderTrajectoryLayer(
+          mockTrajectoryGeoJson
+        );
+      }
+    }
+
+    // =====================================
+    // LOAD TRAFFIC
+    // =====================================
+
+    async function loadTraffic() {
+      try {
+        const now =
+          new Date();
+
+        const fifteenMinutesAgo =
+          new Date(
+            now.getTime() -
+              15 *
+                60 *
+                1000
+          );
+
+        const traffic =
+          await getTrafficHeatmap(
+            fifteenMinutesAgo.toISOString(),
+            now.toISOString()
+          );
+
+        if (disposed) {
+          return;
+        }
+
+        renderTrafficLayer(
+          traffic
+        );
+      } catch {
+        if (disposed) {
+          return;
+        }
+
+        renderTrafficLayer(
+          mockTrafficGeoJson
+        );
+      }
+    }
+
+    // =====================================
+    // INITIAL DATA LOAD
+    // =====================================
+
+    loadCameras();
+    loadTrajectory();
+    loadTraffic();
+
+    // =====================================
+    // TRAFFIC POLLING
+    // =====================================
+
+    const trafficTimer =
+      window.setInterval(
+        () => {
+          if (!disposed) {
+            loadTraffic();
+          }
+        },
+        TRAFFIC_REFRESH_MS
+      );
+
+    // =====================================
+    // LIVE SSE
+    // =====================================
+
+    const stream =
+      connectLiveStream(
+        (event) => {
+          if (disposed) {
+            return;
+          }
+
+          handleLiveEvent(
+            event
+          );
+
+          setLastEvent(
+            event.event
+          );
+        },
+
+        () => {
+          if (!disposed) {
+            setStreamStatus(
               "connected"
             );
-          },
+          }
+        },
 
-          () => {
-            console.log(
-              "Live backend disconnected"
-            );
-
-            setConnectionStatus(
+        () => {
+          if (!disposed) {
+            setStreamStatus(
               "disconnected"
             );
           }
-        );
-
-      // =================================
-      // MOCK LIVE UPDATES
-      // =================================
-      // This allows us to test realtime
-      // behavior before backend is ready.
-      // Remove/disable this later when
-      // actual WebSocket is working.
-      // =================================
-
-      stopMockUpdates =
-        startMockLiveUpdates(
-          (
-            trajectoryData
-          ) => {
-            handleLiveEvent(
-              map,
-              {
-                event:
-                  "trajectory_updated",
-
-                timestamp:
-                  new Date().toISOString(),
-
-                data:
-                  trajectoryData,
-              }
-            );
-
-            setLastLiveUpdate(
-              "Mock trajectory update"
-            );
-
-            console.log(
-              "Mock trajectory event received"
-            );
-          },
-
-          (
-            heatmapData
-          ) => {
-            handleLiveEvent(
-              map,
-              {
-                event:
-                  "traffic_update",
-
-                timestamp:
-                  new Date().toISOString(),
-
-                data:
-                  heatmapData,
-              }
-            );
-
-            setLastLiveUpdate(
-              "Mock traffic update"
-            );
-
-            console.log(
-              "Mock heatmap event received"
-            );
-          }
-        );
-
-      console.log(
-        "Realtime test started"
+        }
       );
-    });
 
-    // =================================
+    function handleLiveEvent(
+      event: LiveEvent
+    ) {
+      if (
+        event.event ===
+        "new_sighting"
+      ) {
+        loadTrajectory();
+      }
+
+      if (
+        event.event ===
+        "new_alert"
+      ) {
+        console.log(
+          "New alert:",
+          event.data
+        );
+      }
+    }
+
+    // =====================================
     // MAP RESIZE
-    // =================================
+    // =====================================
 
     const resizeTimer =
       window.setTimeout(
         () => {
-          map.resize();
+          if (
+            !disposed &&
+            mapRef.current
+          ) {
+            map.invalidateSize();
+          }
         },
-        200
+        250
       );
 
-    // =================================
+    // =====================================
     // CLEANUP
-    // =================================
+    // =====================================
 
     return () => {
+      disposed = true;
+
+      window.clearInterval(
+        trafficTimer
+      );
+
       window.clearTimeout(
         resizeTimer
       );
 
-      socket?.close();
+      stream.close();
 
-      stopMockUpdates?.();
+      cameraLayerRef.current?.remove();
+      trajectoryLayerRef.current?.remove();
+      trafficLayerRef.current?.remove();
 
-      markers.forEach(
-        (marker) => {
-          marker.remove();
-        }
-      );
+      cameraLayerRef.current =
+        null;
 
-      map.remove();
+      trajectoryLayerRef.current =
+        null;
+
+      trafficLayerRef.current =
+        null;
+
+      try {
+        map.remove();
+      } catch {
+        // Prevent Leaflet cleanup
+        // errors during fast navigation.
+      }
 
       mapRef.current =
         null;
+
+      /*
+       * Leaflet stores an internal ID
+       * on the DOM element.
+       *
+       * React may reuse the same DOM
+       * node during route navigation.
+       * Clearing it prevents:
+       *
+       * "Map container is already initialized"
+       */
+
+      const leafletContainer =
+        container as HTMLDivElement & {
+          _leaflet_id?: number;
+        };
+
+      delete leafletContainer._leaflet_id;
+
+      container.innerHTML =
+        "";
     };
+
+    /*
+     * IMPORTANT:
+     *
+     * This effect intentionally runs
+     * once per CityMap mount.
+     *
+     * Layer visibility is handled by
+     * the separate effects below.
+     */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // =================================
-  // TRAJECTORY TOGGLE
-  // =================================
+  // =====================================
+  // CAMERA TOGGLE
+  // =====================================
 
   useEffect(() => {
     const map =
       mapRef.current;
 
-    if (!map) {
+    const layer =
+      cameraLayerRef.current;
+
+    if (!map || !layer) {
       return;
     }
 
-    const visibility =
-      showTrajectory
-        ? "visible"
-        : "none";
-
-    [
-      "trajectory-confirmed",
-      "trajectory-inferred",
-      "trajectory-gap",
-    ].forEach(
-      (layerId) => {
-        if (
-          map.getLayer(
-            layerId
-          )
-        ) {
-          map.setLayoutProperty(
-            layerId,
-
-            "visibility",
-
-            visibility
-          );
-        }
+    if (showCameras) {
+      if (
+        !map.hasLayer(layer)
+      ) {
+        layer.addTo(map);
       }
-    );
+    } else if (
+      map.hasLayer(layer)
+    ) {
+      map.removeLayer(layer);
+    }
+  }, [showCameras]);
+
+  // =====================================
+  // TRAJECTORY TOGGLE
+  // =====================================
+
+  useEffect(() => {
+    const map =
+      mapRef.current;
+
+    const layer =
+      trajectoryLayerRef.current;
+
+    if (!map || !layer) {
+      return;
+    }
+
+    if (showTrajectory) {
+      if (
+        !map.hasLayer(layer)
+      ) {
+        layer.addTo(map);
+      }
+    } else if (
+      map.hasLayer(layer)
+    ) {
+      map.removeLayer(layer);
+    }
   }, [showTrajectory]);
 
-  // =================================
-  // HEATMAP TOGGLE
-  // =================================
+  // =====================================
+  // TRAFFIC TOGGLE
+  // =====================================
 
   useEffect(() => {
     const map =
       mapRef.current;
 
-    if (!map) {
+    const layer =
+      trafficLayerRef.current;
+
+    if (!map || !layer) {
       return;
     }
 
-    if (
-      map.getLayer(
-        "traffic-heatmap"
-      )
+    if (showTraffic) {
+      if (
+        !map.hasLayer(layer)
+      ) {
+        layer.addTo(map);
+      }
+    } else if (
+      map.hasLayer(layer)
     ) {
-      map.setLayoutProperty(
-        "traffic-heatmap",
-
-        "visibility",
-
-        showHeatmap
-          ? "visible"
-          : "none"
-      );
+      map.removeLayer(layer);
     }
-  }, [showHeatmap]);
-
-  // =================================
-  // UI
-  // =================================
+  }, [showTraffic]);
 
   return (
     <div
       style={{
         width: "100%",
-
-        height: "100vh",
-
-        position:
-          "relative",
+        height: "100%",
+        minHeight: "420px",
+        position: "relative",
+        overflow: "hidden",
+        background: "#e5e7eb",
       }}
     >
       {/* MAP */}
 
       <div
-        ref={
-          mapContainerRef
-        }
-
+        ref={mapContainerRef}
         style={{
           width: "100%",
-
           height: "100%",
+          minHeight: "420px",
         }}
       />
 
-      {/* VEHICLE CARD */}
+      {/* STATUS CARD */}
 
       <div
         style={{
-          position:
-            "absolute",
-
-          top: 20,
-
-          left: 20,
-
-          zIndex: 10,
-
+          position: "absolute",
+          top: 16,
+          left: 16,
+          zIndex: 1000,
           background:
-            "rgba(9,21,37,0.93)",
-
-          color:
-            "white",
-
-          padding:
-            "16px 18px",
-
-          borderRadius:
-            "14px",
-
-          minWidth:
-            "260px",
-
+            "rgba(8,17,31,.94)",
+          color: "white",
+          padding: "14px 16px",
+          borderRadius: "12px",
+          minWidth: "230px",
+          border:
+            "1px solid rgba(255,255,255,.08)",
           boxShadow:
-            "0 10px 30px rgba(0,0,0,.25)",
+            "0 10px 30px rgba(0,0,0,.22)",
+          backdropFilter:
+            "blur(8px)",
         }}
       >
         <div
           style={{
-            fontSize:
-              "11px",
-
-            color:
-              "#94a3b8",
-
+            fontSize: "10px",
+            color: "#94a3b8",
             textTransform:
               "uppercase",
-
             letterSpacing:
-              "1px",
+              "1.2px",
           }}
         >
-          Vehicle Tracking
+          Map Status
         </div>
 
         <div
           style={{
-            fontSize:
-              "20px",
-
-            fontWeight:
-              700,
-
-            marginTop:
-              "6px",
+            marginTop: "5px",
+            fontSize: "17px",
+            fontWeight: 700,
           }}
         >
-          UP15AB1234
+          Live Operations
         </div>
-
-        {/* CONNECTION STATUS */}
 
         <div
           style={{
-            marginTop:
-              "10px",
+            marginTop: "9px",
+            fontSize: "11px",
+            color: "#cbd5e1",
+          }}
+        >
+          Data:{" "}
+          <strong>
+            {dataMode ===
+            "backend"
+              ? "Backend"
+              : "Demo GeoJSON"}
+          </strong>
+        </div>
 
-            display:
-              "flex",
-
+        <div
+          style={{
+            marginTop: "8px",
+            display: "flex",
             alignItems:
               "center",
-
-            gap:
-              "7px",
-
-            fontSize:
-              "12px",
+            gap: "7px",
+            fontSize: "11px",
           }}
         >
           <span
             style={{
-              width:
-                "8px",
-
-              height:
-                "8px",
-
+              width: "8px",
+              height: "8px",
               borderRadius:
                 "50%",
-
               display:
                 "inline-block",
-
               background:
-                connectionStatus ===
+                streamStatus ===
                 "connected"
                   ? "#22c55e"
-                  : connectionStatus ===
+                  : streamStatus ===
                     "disconnected"
                   ? "#ef4444"
                   : "#f59e0b",
             }}
           />
 
-          {connectionStatus ===
+          {streamStatus ===
           "connected"
-            ? "Live backend connected"
-
-            : connectionStatus ===
+            ? "Live stream connected"
+            : streamStatus ===
               "disconnected"
-            ? "Backend disconnected"
-
-            : "Using demo data"}
+            ? "Live stream offline"
+            : "Connecting to stream"}
         </div>
-
-        {/* LAST UPDATE */}
 
         <div
           style={{
-            marginTop:
-              "8px",
-
-            fontSize:
-              "11px",
-
-            color:
-              "#94a3b8",
+            marginTop: "7px",
+            fontSize: "10px",
+            color: "#64748b",
           }}
         >
-          Last event:
-          {" "}
+          Last event:{" "}
           <strong
             style={{
-              color:
-                "#e2e8f0",
+              color: "#cbd5e1",
             }}
           >
-            {lastLiveUpdate}
+            {lastEvent}
           </strong>
         </div>
       </div>
@@ -896,366 +1066,389 @@ export default function CityMap() {
 
       <div
         style={{
-          position:
-            "absolute",
-
-          top: 20,
-
-          right: 70,
-
-          zIndex: 10,
-
-          display:
-            "flex",
-
-          gap:
-            "8px",
-
+          position: "absolute",
+          top: 16,
+          right: 16,
+          zIndex: 1000,
+          display: "flex",
+          gap: "6px",
           background:
-            "rgba(9,21,37,0.93)",
-
-          padding:
-            "8px",
-
-          borderRadius:
-            "12px",
+            "rgba(8,17,31,.94)",
+          padding: "7px",
+          borderRadius: "11px",
+          border:
+            "1px solid rgba(255,255,255,.08)",
+          backdropFilter:
+            "blur(8px)",
         }}
       >
-        <button
+        <LayerButton
+          active={showCameras}
+          label="Cameras"
+          onClick={() =>
+            setShowCameras(
+              (value) =>
+                !value
+            )
+          }
+        />
+
+        <LayerButton
+          active={
+            showTrajectory
+          }
+          label="Trajectory"
           onClick={() =>
             setShowTrajectory(
-              !showTrajectory
+              (value) =>
+                !value
             )
           }
+        />
 
-          style={{
-            border:
-              "none",
-
-            cursor:
-              "pointer",
-
-            padding:
-              "9px 14px",
-
-            borderRadius:
-              "8px",
-
-            background:
-              showTrajectory
-                ? "#2563eb"
-                : "#1e293b",
-
-            color:
-              "white",
-          }}
-        >
-          Trajectory
-        </button>
-
-        <button
+        <LayerButton
+          active={showTraffic}
+          label="Traffic"
           onClick={() =>
-            setShowHeatmap(
-              !showHeatmap
+            setShowTraffic(
+              (value) =>
+                !value
             )
           }
-
-          style={{
-            border:
-              "none",
-
-            cursor:
-              "pointer",
-
-            padding:
-              "9px 14px",
-
-            borderRadius:
-              "8px",
-
-            background:
-              showHeatmap
-                ? "#0f766e"
-                : "#1e293b",
-
-            color:
-              "white",
-          }}
-        >
-          Heatmap
-        </button>
+        />
       </div>
 
       {/* LEGEND */}
 
       <div
         style={{
-          position:
-            "absolute",
-
-          bottom:
-            30,
-
-          left:
-            20,
-
-          zIndex:
-            10,
-
+          position: "absolute",
+          bottom: 16,
+          left: 16,
+          zIndex: 1000,
           background:
-            "rgba(9,21,37,0.93)",
-
-          color:
-            "white",
-
-          padding:
-            "14px 16px",
-
-          borderRadius:
-            "12px",
-
-          fontSize:
-            "12px",
-
+            "rgba(8,17,31,.94)",
+          color: "white",
+          padding: "12px 14px",
+          borderRadius: "11px",
+          fontSize: "11px",
+          border:
+            "1px solid rgba(255,255,255,.08)",
           boxShadow:
-            "0 10px 30px rgba(0,0,0,.25)",
+            "0 10px 30px rgba(0,0,0,.2)",
+          backdropFilter:
+            "blur(8px)",
         }}
       >
         <div
           style={{
-            fontWeight:
-              700,
-
-            marginBottom:
-              "10px",
+            fontWeight: 700,
+            marginBottom: "9px",
           }}
         >
-          Map Legend
+          Legend
         </div>
 
-        <LegendLine
-          color="#2563eb"
-          label="Confirmed route"
-        />
+        {showTraffic && (
+          <>
+            <LegendLine
+              color="#22c55e"
+              label="Normal"
+            />
 
-        <LegendLine
-          color="#f59e0b"
-          label="Inferred route"
-          dashed
-        />
+            <LegendLine
+              color="#eab308"
+              label="Moderate"
+            />
 
-        <LegendLine
-          color="#64748b"
-          label="Observation gap"
-          dashed
-        />
+            <LegendLine
+              color="#f97316"
+              label="Heavy"
+            />
 
-        <LegendDot
-          color="#22c55e"
-          label="Camera online"
-        />
+            <LegendLine
+              color="#ef4444"
+              label="Severe"
+            />
 
-        <LegendDot
-          color="#ef4444"
-          label="Camera offline"
-        />
+            <LegendLine
+              color="#94a3b8"
+              label="Low samples"
+            />
+          </>
+        )}
+
+        {showTraffic &&
+          showTrajectory && (
+            <div
+              style={{
+                margin:
+                  "8px 0",
+                borderTop:
+                  "1px solid rgba(255,255,255,.12)",
+              }}
+            />
+          )}
+
+        {showTrajectory && (
+          <>
+            <LegendLine
+              color="#2563eb"
+              label="Trajectory"
+            />
+
+            <LegendLine
+              color="#f59e0b"
+              label="Detour"
+            />
+          </>
+        )}
+
+        {!showTraffic &&
+          !showTrajectory && (
+            <div
+              style={{
+                color: "#64748b",
+                fontSize: "10px",
+              }}
+            >
+              Camera layer only
+            </div>
+          )}
       </div>
     </div>
   );
 }
 
 // =====================================
-// LIVE EVENT HANDLER
+// CAMERA HEALTH
 // =====================================
 
-function handleLiveEvent(
-  map: Map,
-  event: LiveEvent
+function getCameraHealthColor(
+  lastSeenAt: string
 ) {
-  console.log(
-    "LIVE EVENT:",
-    event
-  );
+  const lastSeen =
+    new Date(
+      lastSeenAt
+    ).getTime();
 
-  // =================================
-  // TRAJECTORY UPDATE
-  // =================================
-
-  if (
-    event.event ===
-    "trajectory_updated"
-  ) {
-    const data =
-      event.data as {
-        vehicle_id:
-          string;
-
-        segments: {
-          type:
-            | "confirmed"
-            | "inferred"
-            | "gap";
-
-          confidence:
-            number;
-
-          geometry: {
-            type:
-              "LineString";
-
-            coordinates:
-              [number, number][];
-          };
-        }[];
-      };
-
-    const geoJson = {
-      type:
-        "FeatureCollection" as const,
-
-      features:
-        data.segments.map(
-          (segment) => ({
-            type:
-              "Feature" as const,
-
-            properties: {
-              segmentType:
-                segment.type,
-
-              confidence:
-                segment.confidence,
-            },
-
-            geometry:
-              segment.geometry,
-          })
-        ),
-    };
-
-    const source =
-      map.getSource(
-        "trajectory-data"
-      ) as
-        | GeoJSONSource
-        | undefined;
-
-    if (source) {
-      source.setData(
-        geoJson
-      );
-
-      console.log(
-        "Trajectory updated live"
-      );
-    }
-  }
-
-  // =================================
-  // HEATMAP UPDATE
-  // =================================
+  const minutesSinceSeen =
+    (Date.now() -
+      lastSeen) /
+    1000 /
+    60;
 
   if (
-    event.event ===
-    "traffic_update"
+    minutesSinceSeen <= 5
   ) {
-    const data =
-      event.data as {
-        type:
-          "FeatureCollection";
-
-        features: {
-          type:
-            "Feature";
-
-          geometry: {
-            type:
-              "Point";
-
-            coordinates:
-              [number, number];
-          };
-
-          properties: {
-            density:
-              number;
-
-            vehicle_count?:
-              number;
-          };
-        }[];
-      };
-
-    const source =
-      map.getSource(
-        "heatmap-data"
-      ) as
-        | GeoJSONSource
-        | undefined;
-
-    if (source) {
-      source.setData(
-        data
-      );
-
-      console.log(
-        "Heatmap updated live"
-      );
-    }
+    return "#22c55e";
   }
+
+  if (
+    minutesSinceSeen <= 15
+  ) {
+    return "#f59e0b";
+  }
+
+  return "#94a3b8";
+}
+
+function getCameraHealthLabel(
+  lastSeenAt: string
+) {
+  const lastSeen =
+    new Date(
+      lastSeenAt
+    ).getTime();
+
+  const minutesSinceSeen =
+    (Date.now() -
+      lastSeen) /
+    1000 /
+    60;
+
+  if (
+    minutesSinceSeen <= 5
+  ) {
+    return "Online";
+  }
+
+  if (
+    minutesSinceSeen <= 15
+  ) {
+    return "Delayed";
+  }
+
+  return "Offline / Silent";
 }
 
 // =====================================
-// LEGEND HELPERS
+// TRAJECTORY STYLE
+// =====================================
+
+function getTrajectoryStyle(
+  feature: TrajectoryLineFeature
+): PathOptions {
+  const {
+    link_confidence,
+    skipped_cameras,
+    detour_suspected,
+  } = feature.properties;
+
+  const color =
+    detour_suspected
+      ? "#f59e0b"
+      : "#2563eb";
+
+  const opacity =
+    link_confidence < 0.5
+      ? 0.35
+      : link_confidence <
+          0.75
+      ? 0.65
+      : 1;
+
+  return {
+    color,
+    weight: 5,
+    opacity,
+    dashArray:
+      skipped_cameras.length >
+      0
+        ? "8 8"
+        : undefined,
+  };
+}
+
+// =====================================
+// TRAFFIC STYLE
+// =====================================
+
+function getTrafficStyle(
+  feature: TrafficFeature
+): PathOptions {
+  const {
+    congestion_band,
+    sample_count,
+    weight,
+  } = feature.properties;
+
+  if (
+    sample_count <
+    MIN_TRAFFIC_SAMPLE_COUNT
+  ) {
+    return {
+      color: "#94a3b8",
+      weight: 4,
+      opacity: 0.55,
+    };
+  }
+
+  let color =
+    "#22c55e";
+
+  if (
+    congestion_band ===
+    "moderate"
+  ) {
+    color =
+      "#eab308";
+  }
+
+  if (
+    congestion_band ===
+    "heavy"
+  ) {
+    color =
+      "#f97316";
+  }
+
+  if (
+    congestion_band ===
+    "severe"
+  ) {
+    color =
+      "#ef4444";
+  }
+
+  const lineWidth =
+    Math.max(
+      3,
+      Math.min(
+        10,
+        3 + weight / 25
+      )
+    );
+
+  return {
+    color,
+    weight: lineWidth,
+    opacity: 0.85,
+  };
+}
+
+// =====================================
+// DATE FORMAT
+// =====================================
+
+function formatDateTime(
+  value: string
+) {
+  const date =
+    new Date(value);
+
+  if (
+    Number.isNaN(
+      date.getTime()
+    )
+  ) {
+    return value;
+  }
+
+  return date.toLocaleString();
+}
+
+// =====================================
+// LAYER BUTTON
+// =====================================
+
+function LayerButton({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      style={{
+        border: "none",
+        cursor: "pointer",
+        padding: "8px 11px",
+        borderRadius: "7px",
+        background: active
+          ? "#2563eb"
+          : "#1e293b",
+        color: "white",
+        fontSize: "11px",
+        fontWeight: 600,
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+// =====================================
+// LEGEND
 // =====================================
 
 function LegendLine({
   color,
   label,
-  dashed = false,
-}: {
-  color: string;
-  label: string;
-  dashed?: boolean;
-}) {
-  return (
-    <div
-      style={{
-        display:
-          "flex",
-
-        alignItems:
-          "center",
-
-        gap:
-          "8px",
-
-        marginBottom:
-          "7px",
-      }}
-    >
-      <div
-        style={{
-          width:
-            "28px",
-
-          borderTop:
-            dashed
-              ? `3px dashed ${color}`
-              : `3px solid ${color}`,
-        }}
-      />
-
-      <span>
-        {label}
-      </span>
-    </div>
-  );
-}
-
-function LegendDot({
-  color,
-  label,
 }: {
   color: string;
   label: string;
@@ -1263,38 +1456,20 @@ function LegendDot({
   return (
     <div
       style={{
-        display:
-          "flex",
-
-        alignItems:
-          "center",
-
-        gap:
-          "8px",
-
-        marginBottom:
-          "7px",
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        marginBottom: "6px",
       }}
     >
       <div
         style={{
-          width:
-            "10px",
-
-          height:
-            "10px",
-
-          borderRadius:
-            "50%",
-
-          background:
-            color,
+          width: "24px",
+          borderTop: `4px solid ${color}`,
         }}
       />
 
-      <span>
-        {label}
-      </span>
+      <span>{label}</span>
     </div>
   );
 }
