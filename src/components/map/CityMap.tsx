@@ -26,11 +26,16 @@ import {
   type LiveEvent,
 } from "../../services/liveStream";
 
+import { getRoadRoute } from "../../services/routingService";
+
 import {
   mockCameraGeoJson,
   mockTrajectoryGeoJson,
   mockTrafficGeoJson,
+  DEMO_VEHICLE_ROUTES,
 } from "../../data/mockBackendGeoJson";
+
+import { CAMERA_BY_ID } from "../../data/cameras";
 
 const DEFAULT_VEHICLE_ID = "V123";
 const TRAFFIC_REFRESH_MS = 30_000;
@@ -93,6 +98,13 @@ export default function CityMap({
     useState(
       "Waiting for live stream"
     );
+
+  // Live vehicle simulation state
+  const [liveLabel, setLiveLabel] =
+    useState("");
+
+  const liveMarkerRef =
+    useRef<L.Marker | null>(null);
 
   // =====================================
   // INITIALIZE MAP
@@ -599,32 +611,87 @@ export default function CityMap({
     }
 
     // =====================================
+    // ROAD-SNAP TRAJECTORY
+    // Replace every hop LineString's straight
+    // coordinates with OSRM road geometry.
+    // Falls back silently per-feature on error.
+    // =====================================
+
+    async function snapToRoads(
+      collection: TrajectoryCollection
+    ): Promise<TrajectoryCollection> {
+      const snapped = await Promise.all(
+        collection.features.map(async (feature) => {
+          // Only process LineString hops
+          if (feature.geometry.type !== "LineString") {
+            return feature;
+          }
+
+          const coords =
+            feature.geometry.coordinates as [
+              number,
+              number,
+            ][];
+
+          const from = coords[0] as [
+            number,
+            number,
+          ];
+          const to = coords[
+            coords.length - 1
+          ] as [number, number];
+
+          try {
+            const roadCoords =
+              await getRoadRoute(from, to);
+
+            return {
+              ...feature,
+              geometry: {
+                ...feature.geometry,
+                coordinates: roadCoords,
+              },
+            };
+          } catch {
+            // OSRM unavailable — keep straight line
+            return feature;
+          }
+        })
+      );
+
+      return {
+        ...collection,
+        features:
+          snapped as TrajectoryFeature[],
+      };
+    }
+
+    // =====================================
     // LOAD TRAJECTORY
     // =====================================
 
     async function loadTrajectory() {
+      let raw: TrajectoryCollection;
+
       try {
-        const trajectory =
-          await getVehicleTrajectory(
-            DEFAULT_VEHICLE_ID
-          );
-
-        if (disposed) {
-          return;
-        }
-
-        renderTrajectoryLayer(
-          trajectory
+        raw = await getVehicleTrajectory(
+          DEFAULT_VEHICLE_ID
         );
+        setDataMode("backend");
       } catch {
-        if (disposed) {
-          return;
-        }
-
-        renderTrajectoryLayer(
-          mockTrajectoryGeoJson
-        );
+        raw = mockTrajectoryGeoJson;
+        setDataMode("demo");
       }
+
+      if (disposed) return;
+
+      // Snap hops to real roads
+      const roadSnapped =
+        await snapToRoads(raw);
+
+      if (disposed) return;
+
+      renderTrajectoryLayer(roadSnapped);
     }
 
     // =====================================
@@ -752,6 +819,86 @@ export default function CityMap({
     // MAP RESIZE
     // =====================================
 
+    // =====================================
+    // DEMO LIVE SIMULATION
+    // Cycles a pulsing vehicle marker through
+    // each vehicle's camera waypoints so the
+    // map feels alive when there is no backend.
+    // =====================================
+
+    // Inject pulse keyframe CSS once
+    if (!document.getElementById("ci-pulse-style")) {
+      const styleEl = document.createElement("style");
+      styleEl.id = "ci-pulse-style";
+      styleEl.textContent = `
+        @keyframes ci-pulse {
+          0%   { transform: scale(1);   opacity: 1; }
+          50%  { transform: scale(1.9); opacity: 0.35; }
+          100% { transform: scale(1);   opacity: 1; }
+        }
+        .ci-pulse-ring {
+          width: 18px;
+          height: 18px;
+          border-radius: 50%;
+          background: rgba(34,197,94,0.85);
+          border: 2.5px solid #fff;
+          box-shadow: 0 0 8px rgba(34,197,94,.6);
+          animation: ci-pulse 1.5s ease-in-out infinite;
+        }
+      `;
+      document.head.appendChild(styleEl);
+    }
+
+    const pulsingIcon = L.divIcon({
+      className: "",
+      html: `<div class="ci-pulse-ring"></div>`,
+      iconSize: [18, 18],
+      iconAnchor: [9, 9],
+    });
+
+    // Flatten all routes into one sequence:
+    // each entry: { vehicleId, cameraId, latlng }
+    const sequence = DEMO_VEHICLE_ROUTES.flatMap((route) =>
+      route.cameraIds.map((camId, idx) => ({
+        vehicleId: route.vehicleId,
+        cameraId:  camId,
+        latlng:    [
+          route.waypoints[idx][1], // lat
+          route.waypoints[idx][0], // lng
+        ] as [number, number],
+        cameraName: CAMERA_BY_ID[camId]?.name ?? camId,
+      }))
+    );
+
+    let seqIndex = 0;
+
+    function advanceLiveMarker() {
+      if (disposed || !mapRef.current) return;
+
+      const step = sequence[seqIndex];
+      seqIndex = (seqIndex + 1) % sequence.length;
+
+      if (liveMarkerRef.current) {
+        liveMarkerRef.current.setLatLng(step.latlng);
+      } else {
+        liveMarkerRef.current = L.marker(
+          step.latlng,
+          { icon: pulsingIcon, zIndexOffset: 2000 }
+        ).addTo(map);
+      }
+
+      setLiveLabel(
+        `${step.vehicleId} · ${step.cameraName}`
+      );
+    }
+
+    // Start immediately then every 6 s
+    advanceLiveMarker();
+    const liveTimer = window.setInterval(
+      advanceLiveMarker,
+      6_000
+    );
+
     const resizeTimer =
       window.setTimeout(
         () => {
@@ -781,6 +928,11 @@ export default function CityMap({
       );
 
       stream.close();
+
+      window.clearInterval(liveTimer);
+
+      liveMarkerRef.current?.remove();
+      liveMarkerRef.current = null;
 
       cameraLayerRef.current?.remove();
       trajectoryLayerRef.current?.remove();
@@ -1060,6 +1212,31 @@ export default function CityMap({
             {lastEvent}
           </strong>
         </div>
+
+        {liveLabel && (
+          <div
+            style={{
+              marginTop: "7px",
+              fontSize: "10px",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              color: "#4ade80",
+              fontWeight: 600,
+            }}
+          >
+            <span
+              style={{
+                width: "7px",
+                height: "7px",
+                borderRadius: "50%",
+                background: "#22c55e",
+                flexShrink: 0,
+              }}
+            />
+            {liveLabel}
+          </div>
+        )}
       </div>
 
       {/* LAYER CONTROLS */}

@@ -1,6 +1,11 @@
 import { useMemo, useState } from "react";
 
 import Sidebar from "../components/layout/Sidebar";
+import {
+  ALL_CAMERAS,
+  CAMERA_ZONES,
+  cameraStatus,
+} from "../data/cameras";
 
 type CameraStatus =
   | "online"
@@ -16,53 +21,23 @@ type CameraItem = {
   status: CameraStatus;
 };
 
-const cameras: CameraItem[] = [
-  {
-    id: "C01",
-    name: "Connaught Place",
-    zone: "Central Delhi",
-    heading: 45,
-    lastSeen: "30 sec ago",
-    status: "online",
-  },
-  {
-    id: "C02",
-    name: "India Gate",
-    zone: "Central Delhi",
-    heading: 120,
-    lastSeen: "8 min ago",
-    status: "delayed",
-  },
-  {
-    id: "C03",
-    name: "Karol Bagh",
-    zone: "West Delhi",
-    heading: 250,
-    lastSeen: "25 min ago",
-    status: "silent",
-  },
-  {
-    id: "C04",
-    name: "ITO",
-    zone: "Central Delhi",
-    heading: 310,
-    lastSeen: "1 min ago",
-    status: "online",
-  },
-  {
-    id: "C05",
-    name: "Rajiv Chowk",
-    zone: "Central Delhi",
-    heading: 90,
-    lastSeen: "2 min ago",
-    status: "online",
-  },
-];
+// Build camera list from shared registry
+function formatLastSeen(minutesOffline: number): string {
+  if (minutesOffline === 0) return "< 1 min ago";
+  if (minutesOffline < 60) return `${minutesOffline} min ago`;
+  return `${Math.floor(minutesOffline / 60)}h ago`;
+}
 
-type ZoneFilter =
-  | "all"
-  | "Central Delhi"
-  | "West Delhi";
+const cameras: CameraItem[] = ALL_CAMERAS.map((c) => ({
+  id:       c.id,
+  name:     c.name,
+  zone:     c.zone,
+  heading:  c.heading,
+  lastSeen: formatLastSeen(c.minutesOffline),
+  status:   cameraStatus(c.minutesOffline),
+}));
+
+type ZoneFilter = typeof CAMERA_ZONES[number];
 
 type StatusFilter =
   | "all"
@@ -224,17 +199,11 @@ export default function CameraHealth() {
                 outline: "none",
               }}
             >
-              <option value="all">
-                All zones
-              </option>
-
-              <option value="Central Delhi">
-                Central Delhi
-              </option>
-
-              <option value="West Delhi">
-                West Delhi
-              </option>
+              {CAMERA_ZONES.map((z) => (
+                <option key={z} value={z}>
+                  {z === "all" ? "All zones" : z}
+                </option>
+              ))}
             </select>
 
             <select
