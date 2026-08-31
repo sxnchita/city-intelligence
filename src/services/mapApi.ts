@@ -101,6 +101,25 @@ export type TrajectorySightingProperties = {
   snapshot_url: string | null;
 };
 
+/** Mirrors identity/ScoreBreakdown.java. */
+export type ScoreBreakdown = {
+  plate: number;
+  travel_time: number;
+  appearance: number;
+  total: number;
+
+  /** exact | skeleton | distance1 | distance2 | none */
+  plate_rule: string | null;
+  plate_distance: number | null;
+
+  cosine_similarity: number | null;
+  elapsed_seconds: number | null;
+  typical_seconds: number | null;
+
+  /** The score the rejected second-best candidate reached. */
+  runner_up_total: number | null;
+};
+
 export type TrajectoryHopProperties = {
   kind: "hop";
 
@@ -110,7 +129,15 @@ export type TrajectoryHopProperties = {
   to_camera_id: string;
 
   link_confidence: number | null;
-  score_breakdown: unknown;
+
+  /**
+   * Why the resolver accepted this link. Three signals are scored
+   * independently and summed; the total must clear
+   * identity.threshold (4.0) and beat the runner-up by a margin.
+   * Null when the link predates the breakdown, or on the first
+   * sighting of a vehicle, which has nothing to link to.
+   */
+  score_breakdown: ScoreBreakdown | null;
 
   duration_s: number | null;
   typical_s: number | null;
@@ -262,6 +289,48 @@ export function getTrafficHeatmap(
   return getJson<TrafficCollection>(
     "/api/analytics/heatmap",
     { from, to },
+    signal
+  );
+}
+
+// =====================================
+// ROAD GRAPH
+// GET /api/graph
+//
+// One LineString per directed edge, with
+// the road distance and expected travel
+// time window. Carries the counts so a
+// caller can report the network size
+// without walking the features.
+// =====================================
+
+export type GraphProperties = {
+  from_camera_id: string;
+  to_camera_id: string;
+  road_distance_m: number | null;
+  t_typical_s: number | null;
+  t_min_s: number | null;
+  t_max_s: number | null;
+  intermediate_cameras: string[];
+};
+
+export type GraphFeature = GeoJSONFeature<
+  GeoJSONLineStringGeometry,
+  GraphProperties
+>;
+
+export type GraphCollection =
+  GeoJSONFeatureCollection<GraphFeature> & {
+    edge_count: number;
+    camera_count: number;
+  };
+
+export function getGraph(
+  signal?: AbortSignal
+): Promise<GraphCollection> {
+  return getJson<GraphCollection>(
+    "/api/graph",
+    undefined,
     signal
   );
 }

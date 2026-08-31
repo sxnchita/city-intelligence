@@ -1,13 +1,10 @@
-// =====================================
+// =====================================================================
 // CONNECTION BADGE
 //
-// Always visible on every screen so it is
-// never ambiguous whether what is on the
-// wall is reaching the backend. There is
-// no "demo" state any more — the backend
-// is the only source of data, so the only
+// Whether what is on the wall is reaching the backend. There is no
+// "demo" state: the backend is the only source of data, so the only
 // question is whether it answered.
-// =====================================
+// =====================================================================
 
 export type ConnectionState =
   | "loading"
@@ -17,29 +14,33 @@ export type ConnectionState =
 
 const PRESENTATION: Record<
   ConnectionState,
-  { color: string; label: string }
+  { label: string; className: string; dot: string }
 > = {
   loading: {
-    color: "#94a3b8",
     label: "Loading",
+    className: "text-on-surface-variant",
+    dot: "bg-outline-variant",
   },
-  live: { color: "#22c55e", label: "Live" },
+  live: {
+    label: "Live",
+    className: "text-primary",
+    dot: "bg-primary animate-pulse",
+  },
   connected: {
-    color: "#38bdf8",
     label: "Connected",
+    className: "text-on-surface-variant",
+    dot: "bg-primary-container",
   },
   offline: {
-    color: "#ef4444",
     label: "Backend offline",
+    className: "text-error",
+    dot: "bg-error",
   },
 };
 
 /**
- * @param error   the last fetch error, if any
- * @param loading true while the first load is in flight
- * @param stream  true when an SSE feed is open, which is
- *                the difference between "connected" and
- *                genuinely "live"
+ * @param stream true when an SSE feed is open, which is the difference
+ *               between "connected" and genuinely "live"
  */
 export function connectionState({
   loading = false,
@@ -50,14 +51,8 @@ export function connectionState({
   error?: Error | null;
   stream?: boolean;
 }): ConnectionState {
-  if (error) {
-    return "offline";
-  }
-
-  if (loading) {
-    return "loading";
-  }
-
+  if (error) return "offline";
+  if (loading) return "loading";
   return stream ? "live" : "connected";
 }
 
@@ -68,39 +63,15 @@ export default function ConnectionBadge({
   state: ConnectionState;
   title?: string;
 }) {
-  const { color, label } =
-    PRESENTATION[state];
+  const { label, className, dot } = PRESENTATION[state];
 
   return (
-    <div
+    <span
       title={title}
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "6px",
-        padding: "4px 9px",
-        borderRadius: "999px",
-        background: "rgba(255,255,255,.04)",
-        border: `1px solid ${color}33`,
-        color,
-        fontSize: "10px",
-        fontWeight: 650,
-        letterSpacing: ".4px",
-        textTransform: "uppercase",
-        whiteSpace: "nowrap",
-      }}
+      className={`inline-flex shrink-0 items-center gap-2 rounded-full ghost-border px-3 py-1.5 font-body text-label-caps uppercase whitespace-nowrap ${className}`}
     >
-      <span
-        style={{
-          width: "6px",
-          height: "6px",
-          borderRadius: "50%",
-          background: color,
-          flexShrink: 0,
-        }}
-      />
-
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`} />
       {label}
-    </div>
+    </span>
   );
 }

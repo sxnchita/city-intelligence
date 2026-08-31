@@ -1,3 +1,147 @@
+@import "tailwindcss";
+
+/* =====================================================================
+   ANPR CITY ENGINE — DESIGN SYSTEM
+   Extracted from the Stitch project's DESIGN.md and the rendered CSS of
+   its five screens.
+
+   Brand: minimalism blended with editorial luxury. Calm, authoritative,
+   deliberately unlike frantic surveillance-tech UI. Depth comes from
+   tonal layers and hairline rules, not from shadows and boxes.
+   ===================================================================== */
+
+@theme {
+  /* ---- Colour ------------------------------------------------------
+     Material-3 role names, straight from DESIGN.md. Two values sit
+     alongside the token set because the screens actually paint with
+     them: --color-paper (#F5EFE5) is the warm cream the body uses, and
+     --color-hairline (#E8DFC9) is every 1px rule in the design. The
+     `surface` token is a touch greener and is used for fills.        */
+  --color-surface: #f5fde0;
+  --color-surface-dim: #d5ddc2;
+  --color-surface-bright: #f5fde0;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #eff7da;
+  --color-surface-container: #e9f1d5;
+  --color-surface-container-high: #e4eccf;
+  --color-surface-container-highest: #dee6ca;
+  --color-surface-variant: #dee6ca;
+  --color-surface-tint: #556426;
+
+  --color-on-surface: #171e0c;
+  --color-on-surface-variant: #46483b;
+  --color-inverse-surface: #2c3320;
+  --color-inverse-on-surface: #ecf4d8;
+
+  --color-outline: #76786a;
+  --color-outline-variant: #c6c8b7;
+
+  --color-primary: #536224;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #6b7b3a;
+  --color-on-primary-container: #fbffe4;
+  --color-inverse-primary: #bcce84;
+  --color-primary-fixed: #d8eb9d;
+  --color-primary-fixed-dim: #bcce84;
+  --color-on-primary-fixed: #161e00;
+  --color-on-primary-fixed-variant: #3e4c10;
+
+  --color-secondary: #576332;
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #d8e6a8;
+  --color-on-secondary-container: #5b6836;
+  --color-secondary-fixed: #dbe9ab;
+  --color-secondary-fixed-dim: #bfcd91;
+  --color-on-secondary-fixed: #161e00;
+  --color-on-secondary-fixed-variant: #404b1d;
+
+  /* Tertiary is reserved for water on maps and the second series in
+     any chart. Never used for status.                               */
+  --color-tertiary: #415f77;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #597891;
+  --color-on-tertiary-container: #fcfcff;
+  --color-tertiary-fixed: #cae6ff;
+  --color-tertiary-fixed-dim: #abcae6;
+  --color-on-tertiary-fixed: #001e30;
+  --color-on-tertiary-fixed-variant: #2b4a61;
+
+  --color-error: #ba1a1a;
+  --color-on-error: #ffffff;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+
+  --color-background: #f5fde0;
+  --color-on-background: #171e0c;
+
+  /* The screens' own painted values. */
+  --color-paper: #f5efe5;
+  --color-hairline: #e8dfc9;
+  --color-sand: #efe4ce;
+
+  /* Warning has no M3 role but the design needs one: the "degraded"
+     camera and restricted-zone amber, sampled from the comps.       */
+  --color-warning: #b4690e;
+  --color-warning-container: #ffddb8;
+
+  /* ---- Type --------------------------------------------------------
+     Two families, sharply separated. Playfair carries anything
+     editorial — headlines, city names, and every large figure. Inter
+     carries every control, label and data readout.                  */
+  --font-display: "Playfair Display", Georgia, "Times New Roman", serif;
+  --font-body: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  --text-display-lg: 48px;
+  --text-display-lg--line-height: 1.1;
+  --text-display-lg--letter-spacing: -0.02em;
+  --text-display-lg--font-weight: 600;
+
+  --text-headline-md: 32px;
+  --text-headline-md--line-height: 1.2;
+  --text-headline-md--font-weight: 500;
+
+  --text-headline-sm: 24px;
+  --text-headline-sm--line-height: 1.3;
+  --text-headline-sm--font-weight: 500;
+
+  --text-body-lg: 18px;
+  --text-body-lg--line-height: 1.6;
+
+  --text-body-md: 16px;
+  --text-body-md--line-height: 1.6;
+
+  --text-body-sm: 13px;
+  --text-body-sm--line-height: 1.5;
+
+  /* The wide tracking is not decoration — it is what keeps these
+     legible and "expensive" at 11px. Always pair with uppercase.    */
+  --text-label-caps: 11px;
+  --text-label-caps--line-height: 1.4;
+  --text-label-caps--letter-spacing: 0.15em;
+  --text-label-caps--font-weight: 600;
+
+  /* Plates, IDs, timestamps: Inter with tracking, not a mono face. */
+  --text-data: 14px;
+  --text-data--line-height: 1.4;
+  --text-data--letter-spacing: 0.05em;
+  --text-data--font-weight: 500;
+
+  /* ---- Rhythm ------------------------------------------------------
+     Strict 8px base. Margins run ~1.5x a normal SaaS dashboard: the
+     whitespace is structural here, not leftover.                    */
+  --spacing-unit: 8px;
+  --spacing-gutter: 24px;
+  --spacing-container: 40px;
+
+  --radius-sm: 4px;
+  --radius-lg: 16px;
+
+  /* Barely perceptible — it exists only to lift a panel off the map. */
+  --shadow-ambient: 0 12px 40px rgba(44, 51, 32, 0.08);
+}
+
+/* ===================================================================== */
+
 * {
   box-sizing: border-box;
 }
@@ -6,7 +150,6 @@ html,
 body,
 #root {
   width: 100%;
-  min-width: 100%;
   min-height: 100vh;
   margin: 0;
   padding: 0;
@@ -18,27 +161,14 @@ body {
 }
 
 body {
-  margin: 0;
   min-width: 320px;
-  min-height: 100vh;
-
-  background: #07111f;
-
-  font-family:
-    Inter,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
-
+  background: var(--color-paper);
+  color: var(--color-on-surface);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-}
-
-#root {
-  width: 100%;
-  min-height: 100vh;
 }
 
 button,
@@ -46,4 +176,112 @@ input,
 select,
 textarea {
   font: inherit;
+  color: inherit;
 }
+
+@layer utilities {
+  /* A floating panel over the map. Translucent rather than solid, so
+     the city stays faintly readable underneath it. */
+  .glass-panel {
+    background-color: rgb(245 239 229 / 0.95);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+
+  /* Hairline rules replace cards. One pixel, in a slightly deeper
+     cream than the page — never a grey. */
+  .hairline-t { border-top: 1px solid var(--color-hairline); }
+  .hairline-r { border-right: 1px solid var(--color-hairline); }
+  .hairline-b { border-bottom: 1px solid var(--color-hairline); }
+  .hairline-l { border-left: 1px solid var(--color-hairline); }
+
+  .ambient-shadow { box-shadow: var(--shadow-ambient); }
+
+  /* Ghost border: the outline for buttons and inputs. */
+  .ghost-border { border: 1px solid rgb(23 30 12 / 0.2); }
+
+  .hide-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .hide-scrollbar::-webkit-scrollbar { display: none; }
+}
+
+/* Thin scrollbars everywhere else, tinted to the palette. */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--color-outline-variant);
+  border-radius: 999px;
+}
+
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-weight: normal;
+  font-style: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-variation-settings: "FILL" 0, "wght" 300, "GRAD" 0, "opsz" 24;
+  -webkit-font-feature-settings: "liga";
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+/* ---------------------------------------------------------------------
+   LEAFLET
+   The spec requires a real map base, so the basemap is real tiles —
+   but raw OSM greys would fight the palette. The filter warms the
+   tiles into the sand/sage/dusty-blue range of the design, and the
+   sand ground shows through underneath.
+   --------------------------------------------------------------------- */
+.leaflet-container {
+  background: var(--color-sand) !important;
+  font-family: var(--font-body);
+}
+
+.leaflet-tile-pane {
+  /* Standard OSM is much more saturated than the design's palette.
+     Desaturating hard and warming with sepia lands it in the sand /
+     sage / dusty-blue range, while keeping enough hue separation that
+     parks still read as green and water as blue. Multiplied over the
+     sand ground so the paper shows through. */
+  filter: saturate(0.42) sepia(0.34) brightness(1.08) contrast(0.86)
+    hue-rotate(-6deg);
+  mix-blend-mode: multiply;
+  opacity: 0.72;
+}
+
+/* Leaflet's own chrome, restyled to the system. */
+.leaflet-control-zoom a {
+  background: rgb(245 239 229 / 0.95) !important;
+  color: var(--color-primary) !important;
+  border: 1px solid var(--color-hairline) !important;
+  backdrop-filter: blur(12px);
+  font-weight: 400 !important;
+}
+.leaflet-control-zoom a:hover { background: var(--color-surface) !important; }
+.leaflet-control-attribution {
+  background: rgb(245 239 229 / 0.8) !important;
+  color: var(--color-on-surface-variant) !important;
+  font-size: 10px !important;
+}
+.leaflet-control-attribution a { color: var(--color-primary) !important; }
+
+.leaflet-popup-content-wrapper {
+  background: rgb(245 239 229 / 0.97);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--color-hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-ambient);
+  color: var(--color-on-surface);
+}
+.leaflet-popup-tip {
+  background: rgb(245 239 229 / 0.97);
+  border: 1px solid var(--color-hairline);
+}
+.leaflet-popup-close-button { color: var(--color-on-surface-variant) !important; }

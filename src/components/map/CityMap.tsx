@@ -1,9 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import L, {
-  GeoJSON,
-  Map as LeafletMap,
-} from "leaflet";
-
+import L, { GeoJSON, Map as LeafletMap } from "leaflet";
 import type { PathOptions } from "leaflet";
 
 import "leaflet/dist/leaflet.css";
@@ -14,1887 +10,783 @@ import {
   getVehicleTrajectory,
   type CameraCollection,
   type CameraFeature,
-  type TrafficCollection,
   type TrafficFeature,
   type TrajectoryCollection,
-  type TrajectoryFeature,
-  type TrajectoryLineFeature,
-  type TrajectoryPointFeature,
+  type TrajectoryHopProperties,
+  type TrajectorySightingProperties,
 } from "../../services/mapApi";
 
 import { connectLiveStream } from "../../services/liveStream";
 
+import {
+  HEX,
+  LINK,
+  agoLabel,
+  band,
+  cameraStatus,
+  clockSeconds,
+  distance,
+  duration,
+  linkKind,
+  percent,
+} from "../../design/tokens";
+
+// =====================================================================
+// CITY MAP
+//
+// A real GIS base, per spec 6.1 — the hand-drawn map from the design
+// is an illustration and is used only on the landing screen. The
+// palette is reached instead by warming real tiles with a CSS filter
+// (see .leaflet-tile-pane in index.css) over a sand ground, which is
+// the same treatment the Stitch markup applies to its own map image.
+//
+// Every layer here is backend data. Nothing is drawn that was not
+// returned by an endpoint.
+// =====================================================================
+
 const TRAFFIC_REFRESH_MS = 30_000;
 
-// How long a live sighting pulse stays on the map.
-// Long enough to notice at a glance, short enough
-// that a busy corridor does not turn into a solid
-// blob of markers.
+/** How long a live sighting pulse stays on the map. */
 const SIGHTING_PULSE_MS = 6_000;
 
-// Alert pins outlive sighting pulses: an alert is
-// the thing a viewer is meant to walk over and
-// look at.
+/** Alerts outlive sightings: an alert is meant to be walked over to. */
 const ALERT_PIN_MS = 60_000;
 
-type CityMapProps = {
-  showCamerasInitially?: boolean;
-  showTrajectoryInitially?: boolean;
-  showTrafficInitially?: boolean;
+// Standard OSM tiles: no API key, and a fix as well as a restyle —
+// the previous host (openstreetmap.fr/hot) stopped responding
+// entirely, and CARTO's basemaps now serve an "API KEY REQUIRED"
+// watermark to unkeyed callers.
+//
+// Override for a keyed provider in production, where OSM's tile usage
+// policy does not cover the traffic:
+//   VITE_TILE_URL=https://{s}.example/{z}/{x}/{y}.png
+const TILE_URL =
+  import.meta.env.VITE_TILE_URL ??
+  "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+
+const TILE_ATTRIBUTION =
+  import.meta.env.VITE_TILE_ATTRIBUTION ??
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+
+export type CityMapProps = {
+  showCameras?: boolean;
+  showTrajectory?: boolean;
+  showTraffic?: boolean;
 
   /**
-   * Which vehicle's journey to draw. Vehicle ids
-   * are numeric on the backend. Omitted means the
-   * trajectory layer is simply not drawn -- there
-   * is no honest journey to show without one.
+   * Which vehicle's journey to draw. Omitted means the trajectory
+   * layer is not drawn at all — there is no honest journey without one.
    */
   vehicleId?: number;
 
-  /**
-   * Window for the traffic heatmap, as ISO
-   * instants. Omitting both is the live path: the
-   * backend defaults to the last 15 minutes.
-   */
+  /** Heatmap window. Omitting both is live: the backend defaults to 15 min. */
   from?: string;
   to?: string;
+
+  /**
+   * Sequence number of the focused sighting. Drives the two-way
+   * highlight the spec asks for: the timeline sets this, and the map
+   * pans to and enlarges the matching stop.
+   */
+  focusedStop?: number | null;
+  onStopClick?: (sequence: number) => void;
+
+  onCameraClick?: (cameraId: string) => void;
+  onError?: (message: string | null) => void;
+  onStreamChange?: (open: boolean) => void;
+  onLastEvent?: (label: string) => void;
 };
 
 export default function CityMap({
-  showCamerasInitially = true,
-  showTrajectoryInitially = true,
-  showTrafficInitially = true,
+  showCameras = true,
+  showTrajectory = true,
+  showTraffic = true,
   vehicleId,
   from,
   to,
+  focusedStop = null,
+  onStopClick,
+  onCameraClick,
+  onError,
+  onStreamChange,
+  onLastEvent,
 }: CityMapProps) {
-  const mapContainerRef =
-    useRef<HTMLDivElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<LeafletMap | null>(null);
 
-  const mapRef =
-    useRef<LeafletMap | null>(null);
+  const cameraLayerRef = useRef<GeoJSON | null>(null);
+  const trajectoryLayerRef = useRef<GeoJSON | null>(null);
+  const trafficLayerRef = useRef<GeoJSON | null>(null);
+  const stopLayerRef = useRef<L.LayerGroup | null>(null);
 
-  const cameraLayerRef =
-    useRef<GeoJSON | null>(null);
+  const [cameraSet, setCameraSet] = useState("");
 
-  const trajectoryLayerRef =
-    useRef<GeoJSON | null>(null);
+  // Camera positions, so a streamed sighting — which carries only a
+  // camera_id — can be pinned without a follow-up call.
+  const positionsRef = useRef<Map<string, [number, number]>>(new Map());
 
-  const trafficLayerRef =
-    useRef<GeoJSON | null>(null);
+  // Stop markers by sequence number, for the timeline<->map highlight.
+  const stopMarkersRef = useRef<Map<number, L.Marker>>(new Map());
 
-  const [showCameras, setShowCameras] =
-    useState(showCamerasInitially);
+  const liveMarkersRef = useRef<Set<L.Layer>>(new Set());
 
-  const [
-    showTrajectory,
-    setShowTrajectory,
-  ] = useState(
-    showTrajectoryInitially
-  );
-
-  const [showTraffic, setShowTraffic] =
-    useState(showTrafficInitially);
-
-  const [
-    streamStatus,
-    setStreamStatus,
-  ] = useState<
-    | "connecting"
-    | "connected"
-    | "disconnected"
-  >("connecting");
-
-  // The last error from any of the three loaders.
-  // There is no bundled fallback: if the backend
-  // is not answering the map says so rather than
-  // drawing another city's geometry.
-  const [loadError, setLoadError] =
-    useState<string | null>(null);
-
-  const [lastEvent, setLastEvent] =
-    useState(
-      "Waiting for live stream"
-    );
-
-  // Which camera set the backend is serving —
-  // shown so the map never has to name a city.
-  const [cameraSet, setCameraSet] =
-    useState("");
-
-  const [cameraCount, setCameraCount] =
-    useState(0);
-
-  // Where each camera is, keyed by camera_id, so a
-  // streamed sighting can be pinned without a
-  // second call. Filled by loadCameras.
-  const cameraPositionsRef = useRef<
-    Map<string, [number, number]>
-  >(new Map());
-
-  // Transient live markers, so cleanup can remove
-  // whatever is still on screen at unmount.
-  const liveMarkersRef = useRef<Set<L.Layer>>(
-    new Set()
-  );
-
-  // The init effect runs once, but the page can
-  // change its range afterwards. Refs let the
-  // polling loop read the current window without
-  // tearing the whole map down and rebuilding it.
+  // Props the long-lived loaders read. Refs rather than deps, so
+  // changing a window does not tear the Leaflet map down.
   const fromRef = useRef(from);
   fromRef.current = from;
-
   const toRef = useRef(to);
   toRef.current = to;
+  const vehicleIdRef = useRef(vehicleId);
+  vehicleIdRef.current = vehicleId;
 
-  // Filled by the init effect. Lets a range change
-  // redraw the heatmap without tearing down the
-  // Leaflet map and losing the viewer's pan/zoom.
-  const reloadTrafficRef = useRef<
-    (() => void) | null
-  >(null);
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
+  const onStreamChangeRef = useRef(onStreamChange);
+  onStreamChangeRef.current = onStreamChange;
+  const onLastEventRef = useRef(onLastEvent);
+  onLastEventRef.current = onLastEvent;
+  const onCameraClickRef = useRef(onCameraClick);
+  onCameraClickRef.current = onCameraClick;
+  const onStopClickRef = useRef(onStopClick);
+  onStopClickRef.current = onStopClick;
 
-  // =====================================
-  // INITIALIZE MAP
-  // =====================================
+  const reloadTrafficRef = useRef<(() => void) | null>(null);
+  const reloadTrajectoryRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
-    const container =
-      mapContainerRef.current;
-
-    if (!container) {
-      return;
-    }
-
-    // Prevent duplicate Leaflet map
-    // creation during React StrictMode.
-    if (mapRef.current) {
-      return;
-    }
+    const container = containerRef.current;
+    if (!container || mapRef.current) return;
 
     let disposed = false;
-
-    // Captured once so the cleanup below is not
-    // reading a ref that may have moved on.
     const liveMarkers = liveMarkersRef.current;
+    const stopMarkers = stopMarkersRef.current;
 
-    const map = L.map(
-      container,
-      {
-        zoomControl: true,
-        attributionControl: true,
-      }
-    ).setView(
-      // Replaced by frameMap() from the camera
-      // response — never hardcode a city.
-      [20.59, 78.96],
-      5
-    );
+    const map = L.map(container, {
+      zoomControl: true,
+      attributionControl: true,
+      // Replaced by frameMap() from the camera response — the map
+      // never hardcodes a city.
+    }).setView([20.59, 78.96], 5);
 
     mapRef.current = map;
 
-    // =====================================
-    // BASEMAP
-    // =====================================
+    L.tileLayer(TILE_URL, {
+      attribution: TILE_ATTRIBUTION,
+      maxZoom: 19,
+    }).addTo(map);
 
-    L.tileLayer(
-      "https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png",
-      {
-        attribution:
-          '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team',
-        subdomains: "abc",
-        maxZoom: 20,
-      }
-    ).addTo(map);
+    const fail = (error: unknown) => {
+      if (disposed) return;
+      onErrorRef.current?.(
+        error instanceof Error ? error.message : String(error)
+      );
+    };
 
-    // =====================================
-    // CAMERA LAYER
-    // =====================================
+    // -----------------------------------------------------------------
+    // CAMERAS
+    // -----------------------------------------------------------------
 
-    function renderCameraLayer(
-      collection: CameraCollection
-    ) {
-      if (
-        disposed ||
-        !mapRef.current
-      ) {
-        return;
-      }
+    function cameraMarkerIcon(status: ReturnType<typeof cameraStatus>) {
+      const fill =
+        status === "healthy"
+          ? HEX.primary
+          : status === "degraded"
+            ? HEX.warning
+            : HEX.error;
 
+      // A solid circle with a thin white inner ring and a line-art
+      // glyph — the marker spec from the design system.
+      return L.divIcon({
+        className: "",
+        html: `
+          <div style="
+            width:26px;height:26px;border-radius:50%;
+            background:${fill};
+            border:2px solid ${HEX.white};
+            box-shadow:0 2px 8px rgba(44,51,32,.28);
+            display:flex;align-items:center;justify-content:center;
+            color:${HEX.white};
+          ">
+            <span class="material-symbols-outlined" style="font-size:14px;">
+              videocam
+            </span>
+          </div>`,
+        iconSize: [26, 26],
+        iconAnchor: [13, 13],
+      });
+    }
+
+    function renderCameras(collection: CameraCollection) {
+      if (disposed || !mapRef.current) return;
       cameraLayerRef.current?.remove();
 
-      // Cameras with no coordinates come back as
-      // features with null geometry; Leaflet has
-      // nothing to place for those.
       const placeable = {
         type: "FeatureCollection" as const,
-        features: collection.features.filter(
-          (feature) => feature.geometry !== null
-        ),
+        features: collection.features.filter((f) => f.geometry !== null),
       };
 
-      const layer = L.geoJSON(
-        placeable as never,
-        {
-          pointToLayer: (
-            feature,
-            latlng
-          ) => {
-            const camera =
-              feature as unknown as CameraFeature;
+      const layer = L.geoJSON(placeable as never, {
+        pointToLayer: (feature, latlng) => {
+          const camera = feature as unknown as CameraFeature;
+          const minutes = minutesSince(camera.properties.last_event_at);
+          return L.marker(latlng, {
+            icon: cameraMarkerIcon(cameraStatus(minutes)),
+          });
+        },
+        onEachFeature: (feature, layer) => {
+          const camera = feature as unknown as CameraFeature;
+          const p = camera.properties;
+          const status = cameraStatus(minutesSince(p.last_event_at));
 
-            const color =
-              getCameraHealthColor(
-                camera.properties
-                  .last_event_at,
-                camera.properties.is_active
-              );
+          layer.bindPopup(popup(`
+            <div style="font-weight:600;font-size:15px;font-family:'Playfair Display',serif;">
+              ${p.name}
+            </div>
+            ${row("Camera", p.camera_id)}
+            ${row("Zone", p.zone)}
+            ${row("Heading", `${p.heading_degrees}&deg;`)}
+            ${row("Status", status)}
+            ${row("Last seen", agoLabel(p.last_event_at))}
+          `));
 
-            const heading =
-              camera.properties
-                .heading_degrees;
+          layer.on("click", () =>
+            onCameraClickRef.current?.(p.camera_id)
+          );
+        },
+      });
 
-            const icon =
-              L.divIcon({
-                className:
-                  "camera-marker-wrapper",
-
-                html: `
-                  <div
-                    style="
-                      width: 28px;
-                      height: 28px;
-                      display: flex;
-                      align-items: center;
-                      justify-content: center;
-                      transform: rotate(${heading}deg);
-                    "
-                  >
-                    <div
-                      style="
-                        width: 0;
-                        height: 0;
-                        border-left: 8px solid transparent;
-                        border-right: 8px solid transparent;
-                        border-bottom: 18px solid ${color};
-                        filter: drop-shadow(
-                          0 2px 4px rgba(0,0,0,.45)
-                        );
-                      "
-                    ></div>
-                  </div>
-                `,
-
-                iconSize: [28, 28],
-                iconAnchor: [14, 14],
-              });
-
-            return L.marker(
-              latlng,
-              {
-                icon,
-              }
-            );
-          },
-
-          onEachFeature: (
-            feature,
-            layer
-          ) => {
-            const camera =
-              feature as unknown as CameraFeature;
-
-            const health =
-              getCameraHealthLabel(
-                camera.properties
-                  .last_event_at,
-                camera.properties.is_active
-              );
-
-            layer.bindPopup(`
-              <div
-                style="
-                  min-width: 190px;
-                  font-family: Arial, sans-serif;
-                  line-height: 1.5;
-                "
-              >
-                <strong style="font-size:14px;">
-                  ${camera.properties.name}
-                </strong>
-
-                <br />
-
-                Camera ID:
-                ${camera.properties.camera_id}
-
-                <br />
-
-                Zone:
-                ${camera.properties.zone}
-
-                <br />
-
-                Heading:
-                ${camera.properties.heading_degrees}°
-
-                <br />
-
-                Health:
-                <strong>
-                  ${health}
-                </strong>
-
-                <br />
-
-                Last seen:
-                ${formatDateTime(
-                  camera.properties
-                    .last_event_at
-                )}
-              </div>
-            `);
-          },
-        }
-      );
-
-      cameraLayerRef.current =
-        layer;
-
-      if (
-        showCamerasInitially &&
-        !disposed
-      ) {
-        layer.addTo(map);
-      }
+      cameraLayerRef.current = layer;
+      if (showCameras) layer.addTo(map);
     }
 
-    // =====================================
-    // TRAJECTORY LAYER
-    // =====================================
-
-    function renderTrajectoryLayer(
-      collection: TrajectoryCollection
-    ) {
-      if (
-        disposed ||
-        !mapRef.current
-      ) {
-        return;
-      }
-
-      trajectoryLayerRef.current?.remove();
-
-      const layer = L.geoJSON(
-        collection,
-        {
-          style: (
-            feature
-          ): PathOptions => {
-            const item =
-              feature as unknown as TrajectoryFeature;
-
-            if (
-              item.properties.kind !== "hop"
-            ) {
-              return {};
-            }
-
-            return getTrajectoryStyle(
-              item as TrajectoryLineFeature
-            );
-          },
-
-          pointToLayer: (
-            _feature,
-            latlng
-          ) => {
-            return L.circleMarker(
-              latlng,
-              {
-                radius: 6,
-                color: "#ffffff",
-                weight: 2,
-                fillColor:
-                  "#2563eb",
-                fillOpacity: 1,
-              }
-            );
-          },
-
-          onEachFeature: (
-            feature,
-            layer
-          ) => {
-            const item =
-              feature as unknown as TrajectoryFeature;
-
-            if (
-              item.properties.kind ===
-              "sighting"
-            ) {
-              const point =
-                item as TrajectoryPointFeature;
-
-              layer.bindPopup(`
-                <div
-                  style="
-                    font-family: Arial, sans-serif;
-                    min-width: 175px;
-                    line-height: 1.5;
-                  "
-                >
-                  <strong>
-                    Vehicle sighting
-                  </strong>
-
-                  <br />
-
-                  Camera:
-                  ${
-                    point.properties
-                      .camera_name ??
-                    point.properties.camera_id
-                  }
-
-                  <br />
-
-                  Plate read:
-                  ${
-                    point.properties
-                      .plate_read ??
-                    "unreadable"
-                  }
-
-                  <br />
-
-                  Time:
-                  ${formatDateTime(
-                    point.properties.timestamp
-                  )}
-
-                  ${
-                    point.properties
-                      .plate_confidence !==
-                    null
-                      ? `
-                        <br />
-
-                        Plate confidence:
-                        ${Math.round(
-                          (point.properties
-                            .plate_confidence ??
-                            0) * 100
-                        )}%
-                      `
-                      : ""
-                  }
-                </div>
-              `);
-            } else {
-              const line =
-                item as TrajectoryLineFeature;
-
-              layer.bindPopup(`
-                <div
-                  style="
-                    font-family: Arial, sans-serif;
-                    min-width: 200px;
-                    line-height: 1.5;
-                  "
-                >
-                  <strong>
-                    Route hop
-                  </strong>
-
-                  <br />
-
-                  Link confidence:
-                  ${
-                    line.properties
-                      .link_confidence !== null
-                      ? `${Math.round(
-                          (line.properties
-                            .link_confidence ??
-                            0) * 100
-                        )}%`
-                      : "unknown"
-                  }
-
-                  <br />
-
-                  Travel time:
-                  ${formatSeconds(
-                    line.properties.duration_s
-                  )}
-                  ${
-                    line.properties.typical_s !==
-                    null
-                      ? ` (typical ${formatSeconds(
-                          line.properties.typical_s
-                        )})`
-                      : ""
-                  }
-
-                  <br />
-
-                  Distance:
-                  ${
-                    line.properties.distance_m !==
-                    null
-                      ? `${(
-                          (line.properties
-                            .distance_m ?? 0) /
-                          1000
-                        ).toFixed(2)} km`
-                      : "unknown"
-                  }
-
-                  <br />
-
-                  Path:
-                  ${
-                    line.properties
-                      .geometry_source === "road"
-                      ? "road geometry"
-                      : "straight line (no road data)"
-                  }
-
-                  <br />
-
-                  Skipped cameras:
-                  ${
-                    line.properties
-                      .skipped_cameras
-                      .length > 0
-                      ? line.properties
-                          .skipped_cameras
-                          .join(", ")
-                      : "None"
-                  }
-
-                  <br />
-
-                  Detour suspected:
-                  ${
-                    line.properties
-                      .detour_suspected === null
-                      ? "Unknown"
-                      : line.properties
-                          .detour_suspected
-                      ? "Yes"
-                      : "No"
-                  }
-                </div>
-              `);
-            }
-          },
-        }
-      );
-
-      trajectoryLayerRef.current =
-        layer;
-
-      if (
-        showTrajectoryInitially &&
-        !disposed
-      ) {
-        layer.addTo(map);
-      }
-    }
-
-    // =====================================
-    // TRAFFIC LAYER
-    // =====================================
-
-    function renderTrafficLayer(
-      collection: TrafficCollection
-    ) {
-      if (
-        disposed ||
-        !mapRef.current
-      ) {
-        return;
-      }
-
-      trafficLayerRef.current?.remove();
-
-      const layer = L.geoJSON(
-        collection,
-        {
-          style: (
-            feature
-          ): PathOptions => {
-            return getTrafficStyle(
-              feature as TrafficFeature
-            );
-          },
-
-          onEachFeature: (
-            feature,
-            layer
-          ) => {
-            const traffic =
-              feature as TrafficFeature;
-
-            layer.bindPopup(`
-              <div
-                style="
-                  font-family: Arial, sans-serif;
-                  min-width: 195px;
-                  line-height: 1.5;
-                "
-              >
-                <strong>
-                  ${
-                    traffic.properties
-                      .from_camera_id
-                  }
-                  &rarr;
-                  ${
-                    traffic.properties
-                      .to_camera_id
-                  }
-                </strong>
-
-                <br />
-
-                Congestion:
-                ${
-                  traffic.properties
-                    .congestion_band ??
-                  "too few samples"
-                }
-                ${
-                  traffic.properties
-                    .congestion_ratio !== null
-                    ? ` (${traffic.properties.congestion_ratio.toFixed(
-                        2
-                      )}&times; free flow)`
-                    : ""
-                }
-
-                <br />
-
-                Normalized:
-                ${traffic.properties.normalized.toFixed(
-                  2
-                )}
-
-                <br />
-
-                Weight:
-                ${traffic.properties.weight}
-
-                <br />
-
-                Samples:
-                ${
-                  traffic.properties
-                    .sample_count
-                }
-              </div>
-            `);
-          },
-        }
-      );
-
-      trafficLayerRef.current =
-        layer;
-
-      if (
-        showTrafficInitially &&
-        !disposed
-      ) {
-        layer.addTo(map);
-      }
-    }
-
-    // =====================================
-    // LOAD CAMERAS
-    //
-    // The response carries the map's own
-    // framing, so the view follows whichever
-    // city the backend is configured for.
-    // =====================================
-
-    function frameMap(
-      collection: CameraCollection
-    ) {
-      const { bbox, center, suggested_zoom } =
-        collection;
-
+    function frameMap(collection: CameraCollection) {
+      const { bbox, center, suggested_zoom } = collection;
       if (bbox.length === 4) {
         map.fitBounds(
           [
             [bbox[1], bbox[0]],
             [bbox[3], bbox[2]],
           ],
-          { padding: [40, 40] }
+          { padding: [60, 60] }
         );
-
-        return;
-      }
-
-      if (center.length === 2) {
-        map.setView(
-          [center[1], center[0]],
-          suggested_zoom
-        );
+      } else if (center.length === 2) {
+        map.setView([center[1], center[0]], suggested_zoom);
       }
     }
-
-    // =====================================
-    // LOAD CAMERAS
-    //
-    // The camera response carries the map's
-    // own framing, so this is also what
-    // decides which city the map opens on.
-    // Nothing here is hardcoded.
-    // =====================================
 
     async function loadCameras() {
       try {
-        const cameras =
-          await getCameras();
+        const cameras = await getCameras();
+        if (disposed) return;
 
-        if (disposed) {
-          return;
-        }
-
-        renderCameraLayer(cameras);
+        renderCameras(cameras);
         frameMap(cameras);
 
-        // Keep every camera's position so a
-        // streamed sighting, which carries only a
-        // camera_id, can be pinned without a
-        // follow-up call.
-        const positions = new Map<
-          string,
-          [number, number]
-        >();
-
+        const positions = new Map<string, [number, number]>();
         for (const feature of cameras.features) {
-          if (feature.geometry === null) {
-            continue;
-          }
-
-          const [lon, lat] =
-            feature.geometry.coordinates;
-
-          positions.set(
-            feature.properties.camera_id,
-            [lat, lon]
-          );
+          if (!feature.geometry) continue;
+          const [lon, lat] = feature.geometry.coordinates;
+          positions.set(feature.properties.camera_id, [lat, lon]);
         }
-
-        cameraPositionsRef.current = positions;
+        positionsRef.current = positions;
 
         setCameraSet(cameras.camera_set);
-        setCameraCount(
-          cameras.features.length
-        );
-        setLoadError(null);
+        onErrorRef.current?.(null);
       } catch (error) {
-        if (disposed) {
-          return;
-        }
-
-        // No fallback collection. Drawing another
-        // city's cameras here would be a lie that
-        // survives all the way to a demo.
-        setLoadError(
-          error instanceof Error
-            ? error.message
-            : String(error)
-        );
+        fail(error);
       }
     }
 
-    // =====================================
-    // LOAD TRAJECTORY
+    // -----------------------------------------------------------------
+    // TRAJECTORY
     //
-    // Without a vehicle to follow there is no
-    // honest trajectory to draw, so the layer
-    // stays empty rather than inventing one.
-    //
-    // The backend already returns road geometry
-    // and labels it geometry_source: "road", so
-    // there is nothing to snap here either.
-    // =====================================
+    // Hops and sightings alternate in sequence order, so the list is
+    // walked straight through. Confidence encoding is spec 6.5: a
+    // segment must never look more certain than it is.
+    // -----------------------------------------------------------------
+
+    function stopIcon(sequence: number, focused: boolean) {
+      const size = focused ? 34 : 26;
+      return L.divIcon({
+        className: "",
+        html: `
+          <div style="
+            width:${size}px;height:${size}px;border-radius:50%;
+            background:${focused ? HEX.primary : HEX.primaryContainer};
+            border:2px solid ${HEX.white};
+            box-shadow:0 3px 12px rgba(44,51,32,${focused ? ".38" : ".25"});
+            display:flex;align-items:center;justify-content:center;
+            color:${HEX.white};
+            font-family:Inter,sans-serif;font-size:${focused ? 14 : 12}px;
+            font-weight:600;
+          ">${sequence}</div>`,
+        iconSize: [size, size],
+        iconAnchor: [size / 2, size / 2],
+      });
+    }
+
+    function renderTrajectory(collection: TrajectoryCollection) {
+      if (disposed || !mapRef.current) return;
+
+      trajectoryLayerRef.current?.remove();
+      stopLayerRef.current?.remove();
+      stopMarkersRef.current.clear();
+
+      const lines = {
+        type: "FeatureCollection" as const,
+        features: collection.features.filter(
+          (f) => f.geometry?.type === "LineString"
+        ),
+      };
+
+      const layer = L.geoJSON(lines as never, {
+        style: (feature) =>
+          hopStyle(
+            (feature as unknown as { properties: TrajectoryHopProperties })
+              .properties
+          ),
+        onEachFeature: (feature, layer) => {
+          const p = (
+            feature as unknown as { properties: TrajectoryHopProperties }
+          ).properties;
+          const kind = linkKind(p);
+
+          layer.bindPopup(popup(`
+            <div style="font-weight:600;font-size:13px;">
+              ${LINK[kind].label}
+            </div>
+            ${row("Link confidence", percent(p.link_confidence))}
+            ${row("Took", duration(p.duration_s))}
+            ${row("Typical", duration(p.typical_s))}
+            ${row("Distance", distance(p.distance_m))}
+            ${row("Geometry", p.geometry_source === "road" ? "real road" : "straight line")}
+            ${p.detour_suspected ? row("Detour", "suspected") : ""}
+            ${
+              p.skipped_cameras?.length
+                ? row("Missed by", p.skipped_cameras.join(", "))
+                : ""
+            }
+          `));
+        },
+      });
+
+      trajectoryLayerRef.current = layer;
+      if (showTrajectory) layer.addTo(map);
+
+      // Numbered stops, matching the timeline on the left.
+      const stops = L.layerGroup();
+      for (const feature of collection.features) {
+        if (feature.geometry?.type !== "Point") continue;
+        const p = feature.properties as TrajectorySightingProperties;
+        const [lon, lat] = feature.geometry.coordinates;
+
+        const marker = L.marker([lat, lon], {
+          icon: stopIcon(p.sequence, false),
+          zIndexOffset: 500,
+        });
+
+        marker.bindPopup(popup(`
+          <div style="font-family:'Playfair Display',serif;font-size:15px;font-weight:600;">
+            ${p.camera_name ?? p.camera_id}
+          </div>
+          ${row("Time", clockSeconds(p.timestamp))}
+          ${row("Plate read", p.plate_read ?? "unreadable")}
+          ${row("Confidence", percent(p.plate_confidence))}
+          ${row("Camera", p.camera_id)}
+        `));
+
+        marker.on("click", () => onStopClickRef.current?.(p.sequence));
+
+        stopMarkersRef.current.set(p.sequence, marker);
+        stops.addLayer(marker);
+      }
+
+      stopLayerRef.current = stops;
+      if (showTrajectory) stops.addTo(map);
+
+      const bounds = layer.getBounds();
+      if (bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [80, 80] });
+      }
+    }
 
     async function loadTrajectory() {
-      if (vehicleId === undefined) {
+      const id = vehicleIdRef.current;
+
+      if (id === undefined) {
+        trajectoryLayerRef.current?.remove();
+        stopLayerRef.current?.remove();
+        trajectoryLayerRef.current = null;
+        stopLayerRef.current = null;
+        stopMarkersRef.current.clear();
         return;
       }
 
       try {
-        const response =
-          await getVehicleTrajectory(
-            vehicleId
-          );
-
-        if (disposed) {
-          return;
-        }
-
-        renderTrajectoryLayer(
-          response.geojson
-        );
-        setLoadError(null);
+        const response = await getVehicleTrajectory(id);
+        if (disposed) return;
+        renderTrajectory(response.geojson);
+        onErrorRef.current?.(null);
       } catch (error) {
-        if (disposed) {
-          return;
-        }
-
-        setLoadError(
-          error instanceof Error
-            ? error.message
-            : String(error)
-        );
+        fail(error);
       }
     }
 
-    // =====================================
-    // LOAD TRAFFIC
-    //
-    // from/to come from the page. Passing
-    // neither is the live path: the backend
-    // defaults to the last 15 minutes, which
-    // is exactly what live mode means.
-    // =====================================
+    // -----------------------------------------------------------------
+    // TRAFFIC
+    // -----------------------------------------------------------------
+
+    function renderTraffic(collection: {
+      features: TrafficFeature[];
+    }) {
+      if (disposed || !mapRef.current) return;
+      trafficLayerRef.current?.remove();
+
+      const layer = L.geoJSON(collection as never, {
+        style: (feature) =>
+          trafficStyle(feature as unknown as TrafficFeature),
+        onEachFeature: (feature, layer) => {
+          const p = (feature as unknown as TrafficFeature).properties;
+          const info = band(p.congestion_band);
+
+          layer.bindPopup(popup(`
+            <div style="font-weight:600;font-size:13px;">${info.label}</div>
+            ${row("Segment", `${p.from_camera_id} &rarr; ${p.to_camera_id}`)}
+            ${row("Traversals", String(p.weight))}
+            ${row("Median", duration(p.median_duration_s))}
+            ${row("Free flow", duration(p.free_flow_s))}
+            ${row(
+              "Ratio",
+              p.congestion_ratio !== null
+                ? `${p.congestion_ratio.toFixed(2)}&times;`
+                : "not enough data"
+            )}
+            ${row("Samples", String(p.sample_count))}
+          `));
+        },
+      });
+
+      trafficLayerRef.current = layer;
+      if (showTraffic) layer.addTo(map);
+    }
 
     async function loadTraffic() {
       try {
-        const traffic =
-          await getTrafficHeatmap(
-            fromRef.current,
-            toRef.current
-          );
-
-        if (disposed) {
-          return;
-        }
-
-        renderTrafficLayer(traffic);
-        setLoadError(null);
-      } catch (error) {
-        if (disposed) {
-          return;
-        }
-
-        setLoadError(
-          error instanceof Error
-            ? error.message
-            : String(error)
+        const traffic = await getTrafficHeatmap(
+          fromRef.current,
+          toRef.current
         );
+        if (disposed) return;
+        renderTraffic(traffic);
+        onErrorRef.current?.(null);
+      } catch (error) {
+        fail(error);
       }
     }
-
-    // =====================================
-    // INITIAL DATA LOAD
-    //
-    // Cameras first and awaited, because the
-    // sighting pulses below need the position
-    // lookup it builds.
-    // =====================================
-
-    loadCameras().then(() => {
-      if (!disposed) {
-        loadTrajectory();
-        loadTraffic();
-      }
-    });
 
     reloadTrafficRef.current = loadTraffic;
+    reloadTrajectoryRef.current = loadTrajectory;
 
-    // =====================================
-    // TRAFFIC POLLING
-    // =====================================
+    // Cameras first and awaited: the sighting pulses need the position
+    // lookup it builds.
+    loadCameras().then(() => {
+      if (disposed) return;
+      loadTrajectory();
+      loadTraffic();
+    });
 
-    const trafficTimer =
-      window.setInterval(
-        () => {
-          if (!disposed) {
-            loadTraffic();
-          }
-        },
-        TRAFFIC_REFRESH_MS
-      );
+    const trafficTimer = window.setInterval(() => {
+      if (!disposed) loadTraffic();
+    }, TRAFFIC_REFRESH_MS);
 
-    // =====================================
+    // -----------------------------------------------------------------
     // LIVE MARKERS
-    //
-    // The pulse CSS is injected once per
-    // document rather than per map, so two
-    // mounted maps share one style element.
-    // =====================================
+    // -----------------------------------------------------------------
 
-    if (!document.getElementById("ci-pulse-style")) {
-      const styleEl = document.createElement("style");
-      styleEl.id = "ci-pulse-style";
-      styleEl.textContent = `
-        @keyframes ci-pulse {
-          0%   { transform: scale(1);   opacity: 1; }
-          50%  { transform: scale(1.9); opacity: 0.35; }
-          100% { transform: scale(1);   opacity: 1; }
-        }
-        .ci-pulse-ring {
-          width: 18px;
-          height: 18px;
-          border-radius: 50%;
-          background: rgba(34,197,94,0.85);
-          border: 2.5px solid #fff;
-          box-shadow: 0 0 8px rgba(34,197,94,.6);
-          animation: ci-pulse 1.5s ease-in-out infinite;
-        }
-        .ci-alert-ring {
-          width: 22px;
-          height: 22px;
-          border-radius: 50%;
-          background: rgba(239,68,68,0.85);
-          border: 2.5px solid #fff;
-          box-shadow: 0 0 12px rgba(239,68,68,.7);
-          animation: ci-pulse 1.1s ease-in-out infinite;
-        }
-      `;
-      document.head.appendChild(styleEl);
-    }
+    injectPulseStyle();
 
-    const sightingIcon = L.divIcon({
-      className: "",
-      html: `<div class="ci-pulse-ring"></div>`,
-      iconSize: [18, 18],
-      iconAnchor: [9, 9],
-    });
-
-    const alertIcon = L.divIcon({
-      className: "",
-      html: `<div class="ci-alert-ring"></div>`,
-      iconSize: [22, 22],
-      iconAnchor: [11, 11],
-    });
-
-    /**
-     * Drops a marker that removes itself. Every
-     * marker is also tracked so unmount can clear
-     * whatever is still pulsing.
-     */
-    function dropTransientMarker(
+    function dropTransient(
       position: [number, number],
-      icon: L.DivIcon,
-      popup: string | null,
-      lifetimeMs: number
+      html: string,
+      lifetimeMs: number,
+      popupHtml?: string
     ) {
-      if (disposed || !mapRef.current) {
-        return;
-      }
+      if (disposed || !mapRef.current) return;
 
       const marker = L.marker(position, {
-        icon,
+        icon: L.divIcon({ className: "", html, iconSize: [20, 20], iconAnchor: [10, 10] }),
         zIndexOffset: 2000,
       });
 
-      if (popup) {
-        marker.bindPopup(popup);
-      }
-
+      if (popupHtml) marker.bindPopup(popup(popupHtml));
       marker.addTo(mapRef.current);
-      liveMarkersRef.current.add(marker);
+      liveMarkers.add(marker);
 
       window.setTimeout(() => {
-        liveMarkersRef.current.delete(marker);
+        liveMarkers.delete(marker);
         marker.remove();
       }, lifetimeMs);
     }
 
-    // =====================================
-    // LIVE SSE
-    //
-    // Events are named on the wire, so they
-    // arrive through addEventListener rather
-    // than onmessage. Only events newer than
-    // the backend's 60 s live window are ever
-    // sent, so a backfill never floods this.
-    // =====================================
-
     const stream = connectLiveStream({
-      onOpen: () => {
-        if (!disposed) {
-          setStreamStatus("connected");
-        }
-      },
-
-      onError: () => {
-        if (!disposed) {
-          setStreamStatus("disconnected");
-        }
-      },
+      onOpen: () => !disposed && onStreamChangeRef.current?.(true),
+      onError: () => !disposed && onStreamChangeRef.current?.(false),
 
       onSighting: (data) => {
-        if (disposed) {
-          return;
-        }
+        if (disposed) return;
 
-        setLastEvent(
-          `sighting · ${data.camera_id}${
-            data.plate ? ` · ${data.plate}` : ""
-          }`
+        onLastEventRef.current?.(
+          `${data.camera_id}${data.plate ? ` · ${data.plate}` : ""}`
         );
 
-        const position =
-          cameraPositionsRef.current.get(
-            data.camera_id
-          );
-
+        const position = positionsRef.current.get(data.camera_id);
         if (position) {
-          dropTransientMarker(
+          dropTransient(
             position,
-            sightingIcon,
-            `<strong>${
-              data.plate ?? "plate unreadable"
-            }</strong><br/>vehicle ${
-              data.vehicle_id
-            }<br/>${data.camera_id}`,
-            SIGHTING_PULSE_MS
+            `<div class="anpr-pulse"></div>`,
+            SIGHTING_PULSE_MS,
+            `<div style="font-weight:600;">${data.plate ?? "plate unreadable"}</div>
+             ${row("Vehicle", String(data.vehicle_id))}
+             ${row("Camera", data.camera_id)}`
           );
         }
 
-        // Only redraw when the vehicle on screen
-        // is the one that was just seen.
         if (
-          vehicleId !== undefined &&
-          data.vehicle_id === vehicleId
+          vehicleIdRef.current !== undefined &&
+          data.vehicle_id === vehicleIdRef.current
         ) {
           loadTrajectory();
         }
       },
 
       onAlert: (data) => {
-        if (disposed) {
-          return;
-        }
+        if (disposed) return;
+        onLastEventRef.current?.(`alert · ${data.alert_type}`);
 
-        setLastEvent(
-          `alert · ${data.alert_type}`
-        );
-
-        // The alert payload carries its own
-        // position, so an alert pins the map even
-        // for a camera the lookup does not know.
         const position: [number, number] | null =
           data.lat !== null && data.lon !== null
             ? [data.lat, data.lon]
-            : cameraPositionsRef.current.get(
-                data.camera_id ?? ""
-              ) ?? null;
+            : (positionsRef.current.get(data.camera_id ?? "") ?? null);
 
         if (position) {
-          dropTransientMarker(
+          dropTransient(
             position,
-            alertIcon,
-            `<strong>${data.alert_type}</strong> (${
-              data.severity
-            })<br/>${data.message}<br/>${
-              data.camera_name ??
-              data.camera_id ??
-              ""
-            }`,
-            ALERT_PIN_MS
+            `<div class="anpr-pulse anpr-pulse-alert"></div>`,
+            ALERT_PIN_MS,
+            `<div style="font-weight:600;">${data.alert_type}</div>
+             ${row("Severity", data.severity)}
+             ${row("Where", data.camera_name ?? data.camera_id ?? "—")}
+             <div style="margin-top:6px;font-size:12px;">${data.message}</div>`
           );
         }
       },
     });
 
-    // =====================================
-    // MAP RESIZE
-    // =====================================
-
-    const resizeTimer =
-      window.setTimeout(
-        () => {
-          if (
-            !disposed &&
-            mapRef.current
-          ) {
-            map.invalidateSize();
-          }
-        },
-        250
-      );
-
-    // =====================================
-    // CLEANUP
-    // =====================================
+    const resizeTimer = window.setTimeout(() => {
+      if (!disposed && mapRef.current) map.invalidateSize();
+    }, 250);
 
     return () => {
       disposed = true;
-
-      window.clearInterval(
-        trafficTimer
-      );
-
-      window.clearTimeout(
-        resizeTimer
-      );
-
+      window.clearInterval(trafficTimer);
+      window.clearTimeout(resizeTimer);
       stream.close();
 
-      liveMarkers.forEach((marker) =>
-        marker.remove()
-      );
+      liveMarkers.forEach((m) => m.remove());
       liveMarkers.clear();
 
       cameraLayerRef.current?.remove();
       trajectoryLayerRef.current?.remove();
       trafficLayerRef.current?.remove();
-
-      cameraLayerRef.current =
-        null;
-
-      trajectoryLayerRef.current =
-        null;
-
-      trafficLayerRef.current =
-        null;
+      stopLayerRef.current?.remove();
+      cameraLayerRef.current = null;
+      trajectoryLayerRef.current = null;
+      trafficLayerRef.current = null;
+      stopLayerRef.current = null;
+      stopMarkers.clear();
 
       try {
         map.remove();
       } catch {
-        // Prevent Leaflet cleanup
-        // errors during fast navigation.
+        // Leaflet can throw during fast route changes.
       }
+      mapRef.current = null;
 
-      mapRef.current =
-        null;
-
-      /*
-       * Leaflet stores an internal ID
-       * on the DOM element.
-       *
-       * React may reuse the same DOM
-       * node during route navigation.
-       * Clearing it prevents:
-       *
-       * "Map container is already initialized"
-       */
-
-      const leafletContainer =
-        container as HTMLDivElement & {
-          _leaflet_id?: number;
-        };
-
-      delete leafletContainer._leaflet_id;
-
-      container.innerHTML =
-        "";
+      const el = container as HTMLDivElement & { _leaflet_id?: number };
+      delete el._leaflet_id;
+      container.innerHTML = "";
     };
-
-    /*
-     * IMPORTANT:
-     *
-     * This effect intentionally runs
-     * once per CityMap mount.
-     *
-     * Layer visibility is handled by
-     * the separate effects below.
-     */
+    // Mounts once; everything else is driven through refs and the
+    // effects below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // =====================================
-  // TRAFFIC WINDOW
-  //
-  // The page owns the range; the map just
-  // refetches when it moves. The init effect has
-  // already done the first load, so this only
-  // fires on an actual change.
-  // =====================================
+  // Layer visibility ---------------------------------------------------
 
-  const trafficWindowSettled = useRef(false);
+  useToggle(cameraLayerRef, mapRef, showCameras);
+  useToggle(trajectoryLayerRef, mapRef, showTrajectory);
+  useToggle(stopLayerRef, mapRef, showTrajectory);
+  useToggle(trafficLayerRef, mapRef, showTraffic);
 
+  // Reload when the page changes what it is asking for ------------------
+
+  const settledWindow = useRef(false);
   useEffect(() => {
-    if (!trafficWindowSettled.current) {
-      trafficWindowSettled.current = true;
+    if (!settledWindow.current) {
+      settledWindow.current = true;
       return;
     }
-
     reloadTrafficRef.current?.();
   }, [from, to]);
 
-  // =====================================
-  // CAMERA TOGGLE
-  // =====================================
-
+  const settledVehicle = useRef(false);
   useEffect(() => {
-    const map =
-      mapRef.current;
-
-    const layer =
-      cameraLayerRef.current;
-
-    if (!map || !layer) {
+    if (!settledVehicle.current) {
+      settledVehicle.current = true;
       return;
     }
+    reloadTrajectoryRef.current?.();
+  }, [vehicleId]);
 
-    if (showCameras) {
-      if (
-        !map.hasLayer(layer)
-      ) {
-        layer.addTo(map);
-      }
-    } else if (
-      map.hasLayer(layer)
-    ) {
-      map.removeLayer(layer);
-    }
-  }, [showCameras]);
-
-  // =====================================
-  // TRAJECTORY TOGGLE
-  // =====================================
+  // Timeline -> map highlight -------------------------------------------
 
   useEffect(() => {
-    const map =
-      mapRef.current;
+    const map = mapRef.current;
+    if (!map) return;
 
-    const layer =
-      trajectoryLayerRef.current;
-
-    if (!map || !layer) {
-      return;
-    }
-
-    if (showTrajectory) {
-      if (
-        !map.hasLayer(layer)
-      ) {
-        layer.addTo(map);
+    stopMarkersRef.current.forEach((marker, sequence) => {
+      const focused = sequence === focusedStop;
+      marker.setIcon(stopIconFor(sequence, focused));
+      if (focused) {
+        marker.setZIndexOffset(1000);
+        map.panTo(marker.getLatLng(), { animate: true });
+        marker.openPopup();
+      } else {
+        marker.setZIndexOffset(500);
       }
-    } else if (
-      map.hasLayer(layer)
-    ) {
-      map.removeLayer(layer);
-    }
-  }, [showTrajectory]);
-
-  // =====================================
-  // TRAFFIC TOGGLE
-  // =====================================
-
-  useEffect(() => {
-    const map =
-      mapRef.current;
-
-    const layer =
-      trafficLayerRef.current;
-
-    if (!map || !layer) {
-      return;
-    }
-
-    if (showTraffic) {
-      if (
-        !map.hasLayer(layer)
-      ) {
-        layer.addTo(map);
-      }
-    } else if (
-      map.hasLayer(layer)
-    ) {
-      map.removeLayer(layer);
-    }
-  }, [showTraffic]);
+    });
+  }, [focusedStop]);
 
   return (
-    <div
-      style={{
-        width: "100%",
-        height: "100%",
-        minHeight: "420px",
-        position: "relative",
-        overflow: "hidden",
-        background: "#e5e7eb",
-      }}
-    >
-      {/* MAP */}
-
-      <div
-        ref={mapContainerRef}
-        style={{
-          width: "100%",
-          height: "100%",
-          minHeight: "420px",
-        }}
-      />
-
-      {/* STATUS CARD */}
-
-      <div
-        style={{
-          position: "absolute",
-          top: 16,
-          left: 16,
-          zIndex: 1000,
-          background:
-            "rgba(8,17,31,.94)",
-          color: "white",
-          padding: "14px 16px",
-          borderRadius: "12px",
-          minWidth: "230px",
-          border:
-            "1px solid rgba(255,255,255,.08)",
-          boxShadow:
-            "0 10px 30px rgba(0,0,0,.22)",
-          backdropFilter:
-            "blur(8px)",
-        }}
-      >
-        <div
-          style={{
-            fontSize: "10px",
-            color: "#94a3b8",
-            textTransform:
-              "uppercase",
-            letterSpacing:
-              "1.2px",
-          }}
-        >
-          Map Status
-        </div>
-
-        <div
-          style={{
-            marginTop: "5px",
-            fontSize: "17px",
-            fontWeight: 700,
-          }}
-        >
-          Live Operations
-        </div>
-
-        <div
-          style={{
-            marginTop: "9px",
-            fontSize: "11px",
-            color: "#cbd5e1",
-          }}
-        >
-          {loadError ? (
-            <strong
-              style={{ color: "#ef4444" }}
-            >
-              Backend unreachable
-            </strong>
-          ) : (
-            <>
-              <strong>
-                {cameraSet || "Loading"}
-              </strong>
-
-              {cameraCount > 0 && (
-                <span
-                  style={{
-                    color: "#64748b",
-                  }}
-                >
-                  {" · "}
-                  {cameraCount} cameras
-                </span>
-              )}
-            </>
-          )}
-        </div>
-
-        <div
-          style={{
-            marginTop: "8px",
-            display: "flex",
-            alignItems:
-              "center",
-            gap: "7px",
-            fontSize: "11px",
-          }}
-        >
-          <span
-            style={{
-              width: "8px",
-              height: "8px",
-              borderRadius:
-                "50%",
-              display:
-                "inline-block",
-              background:
-                streamStatus ===
-                "connected"
-                  ? "#22c55e"
-                  : streamStatus ===
-                    "disconnected"
-                  ? "#ef4444"
-                  : "#f59e0b",
-            }}
-          />
-
-          {streamStatus ===
-          "connected"
-            ? "Live stream connected"
-            : streamStatus ===
-              "disconnected"
-            ? "Live stream offline"
-            : "Connecting to stream"}
-        </div>
-
-        <div
-          style={{
-            marginTop: "7px",
-            fontSize: "10px",
-            color: "#64748b",
-          }}
-        >
-          Last event:{" "}
-          <strong
-            style={{
-              color: "#cbd5e1",
-            }}
-          >
-            {lastEvent}
-          </strong>
-        </div>
-
-        {loadError && (
-          <div
-            style={{
-              marginTop: "7px",
-              fontSize: "10px",
-              lineHeight: 1.45,
-              color: "#f87171",
-            }}
-          >
-            {loadError}
-          </div>
-        )}
-      </div>
-
-      {/* LAYER CONTROLS */}
-
-      <div
-        style={{
-          position: "absolute",
-          top: 16,
-          right: 16,
-          zIndex: 1000,
-          display: "flex",
-          gap: "6px",
-          background:
-            "rgba(8,17,31,.94)",
-          padding: "7px",
-          borderRadius: "11px",
-          border:
-            "1px solid rgba(255,255,255,.08)",
-          backdropFilter:
-            "blur(8px)",
-        }}
-      >
-        <LayerButton
-          active={showCameras}
-          label="Cameras"
-          onClick={() =>
-            setShowCameras(
-              (value) =>
-                !value
-            )
-          }
-        />
-
-        <LayerButton
-          active={
-            showTrajectory
-          }
-          label="Trajectory"
-          onClick={() =>
-            setShowTrajectory(
-              (value) =>
-                !value
-            )
-          }
-        />
-
-        <LayerButton
-          active={showTraffic}
-          label="Traffic"
-          onClick={() =>
-            setShowTraffic(
-              (value) =>
-                !value
-            )
-          }
-        />
-      </div>
-
-      {/* LEGEND */}
-
-      <div
-        style={{
-          position: "absolute",
-          bottom: 16,
-          left: 16,
-          zIndex: 1000,
-          background:
-            "rgba(8,17,31,.94)",
-          color: "white",
-          padding: "12px 14px",
-          borderRadius: "11px",
-          fontSize: "11px",
-          border:
-            "1px solid rgba(255,255,255,.08)",
-          boxShadow:
-            "0 10px 30px rgba(0,0,0,.2)",
-          backdropFilter:
-            "blur(8px)",
-        }}
-      >
-        <div
-          style={{
-            fontWeight: 700,
-            marginBottom: "9px",
-          }}
-        >
-          Legend
-        </div>
-
-        {showTraffic && (
-          <>
-            <LegendLine
-              color="#22c55e"
-              label="Free flowing"
-            />
-
-            <LegendLine
-              color="#eab308"
-              label="Moderate"
-            />
-
-            <LegendLine
-              color="#f97316"
-              label="Heavy"
-            />
-
-            <LegendLine
-              color="#ef4444"
-              label="Severe"
-            />
-
-            <LegendLine
-              color="#94a3b8"
-              label="Too few samples to band"
-            />
-          </>
-        )}
-
-        {showTraffic &&
-          showTrajectory && (
-            <div
-              style={{
-                margin:
-                  "8px 0",
-                borderTop:
-                  "1px solid rgba(255,255,255,.12)",
-              }}
-            />
-          )}
-
-        {showTrajectory && (
-          <>
-            <LegendLine
-              color="#2563eb"
-              label="Trajectory"
-            />
-
-            <LegendLine
-              color="#f59e0b"
-              label="Detour"
-            />
-          </>
-        )}
-
-        {!showTraffic &&
-          !showTrajectory && (
-            <div
-              style={{
-                color: "#64748b",
-                fontSize: "10px",
-              }}
-            >
-              Camera layer only
-            </div>
-          )}
-      </div>
+    <div className="relative h-full w-full bg-sand">
+      <div ref={containerRef} className="h-full w-full" />
+      {cameraSet && (
+        <span className="pointer-events-none absolute bottom-2 left-3 z-[400] font-body text-label-caps uppercase text-on-surface-variant/60">
+          {cameraSet}
+        </span>
+      )}
     </div>
   );
 }
 
-// =====================================
-// CAMERA HEALTH
-// =====================================
+// ---------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------
 
-function minutesSince(
-  timestamp: string | null
-): number | null {
-  if (!timestamp) {
-    return null;
-  }
+function useToggle(
+  layerRef: React.RefObject<L.Layer | null>,
+  mapRef: React.RefObject<LeafletMap | null>,
+  visible: boolean
+) {
+  useEffect(() => {
+    const map = mapRef.current;
+    const layer = layerRef.current;
+    if (!map || !layer) return;
 
+    if (visible && !map.hasLayer(layer)) layer.addTo(map);
+    else if (!visible && map.hasLayer(layer)) map.removeLayer(layer);
+  }, [visible, layerRef, mapRef]);
+}
+
+function stopIconFor(sequence: number, focused: boolean) {
+  const size = focused ? 34 : 26;
+  return L.divIcon({
+    className: "",
+    html: `
+      <div style="
+        width:${size}px;height:${size}px;border-radius:50%;
+        background:${focused ? HEX.primary : HEX.primaryContainer};
+        border:2px solid ${HEX.white};
+        box-shadow:0 3px 12px rgba(44,51,32,${focused ? ".38" : ".25"});
+        display:flex;align-items:center;justify-content:center;
+        color:${HEX.white};font-family:Inter,sans-serif;
+        font-size:${focused ? 14 : 12}px;font-weight:600;
+      ">${sequence}</div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
+function hopStyle(p: TrajectoryHopProperties): PathOptions {
+  const style = LINK[linkKind(p)];
+  return {
+    color: style.hex,
+    weight: style.weight,
+    opacity: style.opacity,
+    dashArray: style.dashArray,
+    lineCap: "round",
+    lineJoin: "round",
+  };
+}
+
+function trafficStyle(feature: TrafficFeature): PathOptions {
+  const { congestion_band, weight } = feature.properties;
+
+  // A null band is the backend declining to claim a level for an edge
+  // it saw too few times. Grey is the honest colour for that.
+  const info = band(congestion_band);
+
+  return {
+    color: info.hex,
+    weight: congestion_band
+      ? Math.max(3, Math.min(10, 3 + weight / 25))
+      : 3,
+    opacity: congestion_band ? 0.85 : 0.5,
+    lineCap: "round",
+  };
+}
+
+function minutesSince(timestamp: string | null): number {
+  if (!timestamp) return Number.MAX_SAFE_INTEGER;
   const seen = new Date(timestamp).getTime();
-
-  if (Number.isNaN(seen)) {
-    return null;
-  }
-
-  return (Date.now() - seen) / 1000 / 60;
+  if (Number.isNaN(seen)) return Number.MAX_SAFE_INTEGER;
+  return Math.max(0, (Date.now() - seen) / 60000);
 }
 
-function getCameraHealthColor(
-  lastEventAt: string | null,
-  isActive = true
-) {
-  if (!isActive) {
-    return "#475569";
-  }
-
-  const since = minutesSince(lastEventAt);
-
-  if (since === null) {
-    return "#94a3b8";
-  }
-
-  if (since <= 5) {
-    return "#22c55e";
-  }
-
-  if (since <= 15) {
-    return "#f59e0b";
-  }
-
-  return "#94a3b8";
+/** Popup body in the design's type, since Leaflet takes raw HTML. */
+function popup(inner: string): string {
+  return `<div style="min-width:190px;font-family:Inter,sans-serif;font-size:12px;line-height:1.6;color:${HEX.onSurface};">${inner}</div>`;
 }
 
-function getCameraHealthLabel(
-  lastEventAt: string | null,
-  isActive = true
-) {
-  if (!isActive) {
-    return "Deactivated";
-  }
-
-  const since = minutesSince(lastEventAt);
-
-  if (since === null) {
-    return "Never reported";
-  }
-
-  if (since <= 5) {
-    return "Online";
-  }
-
-  if (since <= 15) {
-    return "Delayed";
-  }
-
-  return "Offline / Silent";
+function row(label: string, value: string): string {
+  return `<div style="display:flex;justify-content:space-between;gap:14px;margin-top:3px;">
+    <span style="color:${HEX.onSurfaceVariant};text-transform:uppercase;font-size:10px;letter-spacing:.12em;">${label}</span>
+    <span style="font-weight:500;">${value}</span>
+  </div>`;
 }
 
-// =====================================
-// TRAJECTORY STYLE
-// =====================================
+function injectPulseStyle() {
+  if (document.getElementById("anpr-pulse-style")) return;
 
-function getTrajectoryStyle(
-  feature: TrajectoryLineFeature
-): PathOptions {
-  const {
-    link_confidence,
-    skipped_cameras,
-    detour_suspected,
-  } = feature.properties;
-
-  const color = detour_suspected
-    ? "#f59e0b"
-    : "#2563eb";
-
-  // An unknown confidence is drawn faintly rather
-  // than confidently: the link exists, but the
-  // resolver could not score it.
-  const confidence = link_confidence ?? 0;
-
-  const opacity =
-    link_confidence === null
-      ? 0.3
-      : confidence < 0.5
-      ? 0.35
-      : confidence < 0.75
-      ? 0.65
-      : 1;
-
-  return {
-    color,
-    weight: 5,
-    opacity,
-    dashArray:
-      skipped_cameras.length > 0
-        ? "8 8"
-        : undefined,
-  };
-}
-
-// =====================================
-// TRAFFIC STYLE
-// =====================================
-
-function getTrafficStyle(
-  feature: TrafficFeature
-): PathOptions {
-  const { congestion_band, weight } =
-    feature.properties;
-
-  // A null band is the backend saying this edge was
-  // traversed fewer than analytics.min-samples times
-  // and it will not claim a congestion level for it.
-  // Grey is the honest colour for that; inventing a
-  // second, disagreeing threshold here is not.
-  if (congestion_band === null) {
-    return {
-      color: "#94a3b8",
-      weight: 4,
-      opacity: 0.55,
-    };
-  }
-
-  const color =
-    congestion_band === "moderate"
-      ? "#eab308"
-      : congestion_band === "heavy"
-      ? "#f97316"
-      : congestion_band === "severe"
-      ? "#ef4444"
-      : "#22c55e";
-
-  const lineWidth = Math.max(
-    3,
-    Math.min(10, 3 + weight / 25)
-  );
-
-  return {
-    color,
-    weight: lineWidth,
-    opacity: 0.85,
-  };
-}
-
-// =====================================
-// DATE FORMAT
-// =====================================
-
-function formatDateTime(
-  value: string | null
-) {
-  if (!value) {
-    return "never";
-  }
-
-  const date =
-    new Date(value);
-
-  if (
-    Number.isNaN(
-      date.getTime()
-    )
-  ) {
-    return value;
-  }
-
-  return date.toLocaleString();
-}
-
-function formatSeconds(
-  seconds: number | null
-) {
-  if (seconds === null) {
-    return "unknown";
-  }
-
-  if (seconds < 60) {
-    return `${Math.round(seconds)}s`;
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  const rest = Math.round(seconds % 60);
-
-  return rest === 0
-    ? `${minutes}m`
-    : `${minutes}m ${rest}s`;
-}
-
-// =====================================
-// LAYER BUTTON
-// =====================================
-
-function LayerButton({
-  active,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      style={{
-        border: "none",
-        cursor: "pointer",
-        padding: "8px 11px",
-        borderRadius: "7px",
-        background: active
-          ? "#2563eb"
-          : "#1e293b",
-        color: "white",
-        fontSize: "11px",
-        fontWeight: 600,
-      }}
-    >
-      {label}
-    </button>
-  );
-}
-
-// =====================================
-// LEGEND
-// =====================================
-
-function LegendLine({
-  color,
-  label,
-}: {
-  color: string;
-  label: string;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: "8px",
-        marginBottom: "6px",
-      }}
-    >
-      <div
-        style={{
-          width: "24px",
-          borderTop: `4px solid ${color}`,
-        }}
-      />
-
-      <span>{label}</span>
-    </div>
-  );
+  const style = document.createElement("style");
+  style.id = "anpr-pulse-style";
+  style.textContent = `
+    @keyframes anpr-pulse {
+      0%   { transform: scale(1);   opacity: 1; }
+      50%  { transform: scale(1.9); opacity: .35; }
+      100% { transform: scale(1);   opacity: 1; }
+    }
+    .anpr-pulse {
+      width: 16px; height: 16px; border-radius: 50%;
+      background: ${HEX.primaryContainer};
+      border: 2px solid ${HEX.white};
+      box-shadow: 0 0 10px rgba(107,123,58,.55);
+      animation: anpr-pulse 1.5s ease-in-out infinite;
+    }
+    .anpr-pulse-alert {
+      background: ${HEX.error};
+      box-shadow: 0 0 12px rgba(186,26,26,.6);
+      animation-duration: 1.1s;
+    }`;
+  document.head.appendChild(style);
 }

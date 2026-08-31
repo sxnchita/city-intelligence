@@ -1,133 +1,94 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 
-import Sidebar from "../components/layout/Sidebar";
-import ConnectionBadge, {
-  connectionState,
-} from "../components/common/ConnectionBadge";
+import AppShell, { MapWorkspace } from "../components/layout/AppShell";
+import CityMap from "../components/map/CityMap";
+import { connectionState } from "../components/common/ConnectionBadge";
 import EmptyState, {
   NO_DATA_HINT,
   OFFLINE_HINT,
 } from "../components/common/EmptyState";
 import { useApiData } from "../hooks/useApiData";
 import {
+  Chip,
+  FloatingCard,
+  Icon,
+  Label,
+  SidePanel,
+  Sparkline,
+} from "../design/ui";
+import { agoLabel, percent, severity } from "../design/tokens";
+import {
   alertTypeLabel,
+  getAlert,
   getAlerts,
+  type AlertDetail,
   type AlertSummary,
-  type Severity,
+  type AlertType,
 } from "../services/alertsApi";
 import {
   connectLiveStream,
   type AlertEventData,
 } from "../services/liveStream";
 
-type AlertItem = {
-  id: string;
-  alertId: number;
-  severity: Severity;
-  title: string;
-  description: string;
-  time: string;
-  vehicle?: string;
-  camera?: string;
-  zone?: string;
-  confidence?: string;
-  repeatCount: number;
-  isLive: boolean;
-};
+// =====================================================================
+// LIVE ALERTS
+//
+// A feed of things worth looking at, over the map they happened on.
+// Each card is keyed to its severity by a coloured left rule rather
+// than a filled background — the palette stays calm even when the
+// content is not.
+//
+// A clone alert expands to show both vehicles side by side, because
+// naming only one of them would hide the whole point of the alert.
+// =====================================================================
 
-function formatTime(
-  timestamp: string
-): string {
-  const date = new Date(timestamp);
+type Filter = "all" | AlertType;
 
-  return Number.isNaN(date.getTime())
-    ? timestamp
-    : date.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-}
+const FILTERS: { value: Filter; label: string }[] = [
+  { value: "all", label: "All" },
+  { value: "blacklist_match", label: "Blacklist" },
+  { value: "plate_appearance_mismatch", label: "Cloned plate" },
+  { value: "impossible_speed", label: "Speed" },
+  { value: "restricted_zone_entry", label: "Restricted zone" },
+];
 
-function toAlertItem(
-  row: AlertSummary,
-  isLive = false
-): AlertItem {
-  const confidence =
-    row.metadata &&
-    typeof row.metadata.plate_confidence ===
-      "number"
-      ? `${Math.round(
-          row.metadata.plate_confidence * 100
-        )}%`
-      : undefined;
-
+/** The stream sends a narrower row than /api/alerts. */
+function fromStream(data: AlertEventData): AlertSummary {
   return {
-    id: String(row.alert_id),
-    alertId: row.alert_id,
-    severity: row.severity,
-    title: alertTypeLabel(row.alert_type),
-    description: row.message,
-    time: formatTime(row.occurred_at),
-    vehicle: row.plate ?? undefined,
-    camera: row.camera_name
-      ? `${row.camera_id} · ${row.camera_name}`
-      : row.camera_id ?? undefined,
-    zone: row.zone ?? undefined,
-    confidence,
-    repeatCount: row.repeat_count,
-    isLive,
-  };
-}
-
-/**
- * The stream payload is deliberately narrower than
- * an /api/alerts row: it carries no plate, zone or
- * repeat count. Those are left absent rather than
- * faked, so a live row never claims to know
- * something it was not told.
- */
-function toLiveAlertItem(
-  data: AlertEventData
-): AlertItem {
-  return {
-    id: String(data.alert_id),
-    alertId: data.alert_id,
+    alert_id: data.alert_id,
+    alert_type: data.alert_type,
     severity: data.severity,
-    title: alertTypeLabel(data.alert_type),
-    description: data.message,
-    time: formatTime(data.occurred_at),
-    camera: data.camera_name
-      ? `${data.camera_id} · ${data.camera_name}`
-      : data.camera_id ?? undefined,
-    repeatCount: 1,
-    isLive: true,
+    vehicle_id: data.vehicle_id,
+    related_vehicle_id: data.related_vehicle_id,
+    plate: null,
+    observation_id: null,
+    camera_id: data.camera_id,
+    camera_name: data.camera_name,
+    zone: null,
+    lat: data.lat,
+    lon: data.lon,
+    occurred_at: data.occurred_at,
+    created_at: data.occurred_at,
+    repeat_count: 1,
+    message: data.message,
+    metadata: data.metadata,
   };
 }
-
-type AlertFilter = "all" | Severity;
 
 export default function Alerts() {
-  const [filter, setFilter] =
-    useState<AlertFilter>("all");
-
-  const [selectedAlertId, setSelectedAlertId] =
-    useState<string | null>(null);
+  const [filter, setFilter] = useState<Filter>("all");
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [streamOpen, setStreamOpen] = useState(false);
+  const [streamed, setStreamed] = useState<AlertSummary[]>([]);
 
   const {
     data: fetchedAlerts,
     loading,
     error,
     reload,
-  } = useApiData<AlertItem[]>(
-    async (signal) =>
-      (
-        await getAlerts({ limit: 50 }, signal)
-      ).map((row) => toAlertItem(row)),
+  } = useApiData<AlertSummary[]>(
+    (signal) => getAlerts({ limit: 50 }, signal),
     []
   );
 
@@ -136,44 +97,21 @@ export default function Alerts() {
     [fetchedAlerts]
   );
 
-  // Alerts arriving on the stream are prepended
-  // so the feed moves without a refetch.
-  const [streamed, setStreamed] = useState<
-    AlertItem[]
-  >([]);
-
-  const [streamOpen, setStreamOpen] =
-    useState(false);
-
-  // A blacklisted vehicle crossing the city fires
-  // alerts in bursts. One refetch per alert would
-  // be a request every few hundred milliseconds
-  // for a list that has barely changed.
-  const lastReloadRef = useRef(0);
+  // A blacklisted vehicle crossing the city fires alerts in bursts.
+  // One refetch per alert would be a request every few hundred ms.
+  const lastReload = useRef(0);
   const REFETCH_THROTTLE_MS = 3000;
 
   useEffect(() => {
     const stream = connectLiveStream({
       onOpen: () => setStreamOpen(true),
       onError: () => setStreamOpen(false),
-
       onAlert: (data) => {
-        setStreamed((current) => [
-          toLiveAlertItem(data),
-          ...current,
-        ]);
+        setStreamed((current) => [fromStream(data), ...current]);
 
-        // Refetch so the streamed row is replaced
-        // by the full /api/alerts version, which
-        // carries the plate, zone and the repeat
-        // count the stream does not send.
         const now = Date.now();
-
-        if (
-          now - lastReloadRef.current >
-          REFETCH_THROTTLE_MS
-        ) {
-          lastReloadRef.current = now;
+        if (now - lastReload.current > REFETCH_THROTTLE_MS) {
+          lastReload.current = now;
           reload();
         }
       },
@@ -182,756 +120,359 @@ export default function Alerts() {
     return () => stream.close();
   }, [reload]);
 
+  // The fetched row wins: it carries the plate, zone and repeat count
+  // the stream payload does not send.
   const alerts = useMemo(() => {
     const seen = new Set<number>();
+    return [...fetched, ...streamed].filter((alert) => {
+      if (seen.has(alert.alert_id)) return false;
+      seen.add(alert.alert_id);
+      return true;
+    });
+  }, [fetched, streamed]);
 
-    return [...streamed, ...fetched].filter(
-      (alert) => {
-        if (seen.has(alert.alertId)) {
-          return false;
-        }
+  const visible = useMemo(
+    () =>
+      filter === "all"
+        ? alerts
+        : alerts.filter((a) => a.alert_type === filter),
+    [alerts, filter]
+  );
 
-        seen.add(alert.alertId);
-        return true;
-      }
+  const lastHour = useMemo(() => {
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    return alerts.filter(
+      (a) => new Date(a.occurred_at).getTime() >= cutoff
     );
-  }, [streamed, fetched]);
+  }, [alerts]);
 
-  const filteredAlerts =
-    useMemo(() => {
-      if (filter === "all") {
-        return alerts;
-      }
-
-      return alerts.filter(
-        (alert) =>
-          alert.severity === filter
-      );
-    }, [alerts, filter]);
-
-  const selectedAlert =
-    alerts.find(
-      (alert) =>
-        alert.id === selectedAlertId
-    ) ?? alerts[0];
-
-  const highCount = alerts.filter(
-    (a) => a.severity === "high"
-  ).length;
-
-  const mediumCount = alerts.filter(
-    (a) => a.severity === "medium"
-  ).length;
-
-  const lowCount = alerts.filter(
-    (a) => a.severity === "low"
-  ).length;
-
-  function handleFilterChange(
-    value: AlertFilter
-  ) {
-    setFilter(value);
-
-    if (value === "all") {
-      return;
+  // Alerts per 5-minute bucket across the last hour, for the sparkline.
+  const rateSeries = useMemo(() => {
+    const buckets = new Array(12).fill(0);
+    const now = Date.now();
+    for (const alert of lastHour) {
+      const minutesAgo =
+        (now - new Date(alert.occurred_at).getTime()) / 60000;
+      const index = 11 - Math.floor(minutesAgo / 5);
+      if (index >= 0 && index < 12) buckets[index] += 1;
     }
-
-    const firstMatchingAlert =
-      alerts.find(
-        (alert) =>
-          alert.severity === value
-      );
-
-    if (firstMatchingAlert) {
-      setSelectedAlertId(
-        firstMatchingAlert.id
-      );
-    }
-  }
+    return buckets;
+  }, [lastHour]);
 
   return (
-    <div
-      style={{
-        width: "100%",
-        minHeight: "100vh",
-        background: "#07111f",
-        color: "white",
-        display: "flex",
-        fontFamily:
-          "Inter, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-      }}
+    <AppShell
+      connection={connectionState({
+        loading,
+        error,
+        stream: streamOpen,
+      })}
+      connectionTitle={error ? error.message : undefined}
     >
-      <Sidebar />
-
-      <main
-        style={{
-          flex: 1,
-          minWidth: 0,
-          padding: "18px",
-        }}
-      >
-        {/* HEADER */}
-
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            gap: "16px",
-            marginBottom: "16px",
-          }}
-        >
-          <div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "10px",
-              }}
-            >
-              <div
-                style={{
-                  fontSize: "24px",
-                  fontWeight: 750,
-                }}
-              >
-                Alerts
-              </div>
-
-              <ConnectionBadge
-                state={connectionState({
-                  loading,
-                  error,
-                  stream: streamOpen,
-                })}
-                title={
-                  error ? error.message : undefined
-                }
-              />
-            </div>
-
-            <div
-              style={{
-                marginTop: "4px",
-                fontSize: "12px",
-                color: "#7f9dbd",
-              }}
-            >
-              Live incidents, anomalies and system warnings
-            </div>
-          </div>
-
-          <select
-            value={filter}
-            onChange={(event) =>
-              handleFilterChange(
-                event.target
-                  .value as AlertFilter
-              )
-            }
-            style={{
-              height: "40px",
-              borderRadius: "10px",
-              border:
-                "1px solid rgba(148,163,184,.16)",
-              background: "#0c1b2d",
-              color: "white",
-              padding: "0 12px",
-              outline: "none",
-            }}
-          >
-            <option value="all">
-              All alerts
-            </option>
-
-            <option value="high">
-              High
-            </option>
-
-            <option value="medium">
-              Medium
-            </option>
-
-            <option value="low">
-              Low
-            </option>
-          </select>
-        </div>
-
-        {/* KPI */}
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns:
-              "repeat(4, minmax(0,1fr))",
-            gap: "10px",
-            marginBottom: "14px",
-          }}
-        >
-          <AlertKpi
-            label="Active Alerts"
-            value={String(alerts.length)}
-            color="#ef4444"
+      <MapWorkspace
+        map={
+          <CityMap
+            showCameras
+            showTraffic={false}
+            showTrajectory={false}
+            onStreamChange={setStreamOpen}
           />
-
-          <AlertKpi
-            label="High"
-            value={String(highCount)}
-            color="#dc2626"
-          />
-
-          <AlertKpi
-            label="Medium"
-            value={String(mediumCount)}
-            color="#f97316"
-          />
-
-          <AlertKpi
-            label="Low"
-            value={String(lowCount)}
-            color="#f59e0b"
-          />
-        </div>
-
-        {/* CONTENT */}
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns:
-              "minmax(0, 2fr) minmax(300px, .8fr)",
-            gap: "12px",
-          }}
-        >
-          {/* ALERT FEED */}
-
-          <section
-            style={{
-              background: "#091828",
-              border:
-                "1px solid rgba(255,255,255,0.07)",
-              borderRadius: "16px",
-              padding: "16px",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                justifyContent:
-                  "space-between",
-                alignItems: "center",
-                marginBottom: "14px",
-              }}
-            >
-              <div>
-                <div
-                  style={{
-                    fontSize: "15px",
-                    fontWeight: 700,
-                  }}
-                >
-                  Live Alert Feed
-                </div>
-
-                <div
-                  style={{
-                    marginTop: "4px",
-                    fontSize: "10px",
-                    color: "#64748b",
-                  }}
-                >
-                  Showing{" "}
-                  {filteredAlerts.length}{" "}
-                  alert
-                  {filteredAlerts.length ===
-                  1
-                    ? ""
-                    : "s"}
-                </div>
-              </div>
-
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  color: streamOpen
-                    ? "#4ade80"
-                    : "#64748b",
-                  fontSize: "10px",
-                  fontWeight: 650,
-                }}
-              >
+        }
+        panel={
+          <SidePanel width="w-[420px]">
+            <header className="hairline-b px-6 pt-6 pb-5">
+              <div className="flex items-center gap-2.5">
+                <h1 className="font-display text-headline-md text-on-surface">
+                  Live Alerts
+                </h1>
                 <span
-                  style={{
-                    width: "7px",
-                    height: "7px",
-                    borderRadius: "50%",
-                    background: streamOpen
-                      ? "#22c55e"
-                      : "#64748b",
-                  }}
+                  className={`h-2 w-2 rounded-full ${
+                    streamOpen
+                      ? "animate-pulse bg-primary"
+                      : "bg-outline-variant"
+                  }`}
+                  title={
+                    streamOpen ? "Streaming" : "Stream closed"
+                  }
                 />
-
-                {streamOpen
-                  ? "Streaming"
-                  : "Stream closed"}
               </div>
-            </div>
 
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "10px",
-              }}
-            >
-              {filteredAlerts.length === 0 ? (
+              <div className="mt-4 flex flex-wrap gap-2">
+                {FILTERS.map((option) => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    onClick={() => setFilter(option.value)}
+                    className={`rounded-full px-3 py-1.5 font-body text-label-caps uppercase transition-colors ${
+                      filter === option.value
+                        ? "bg-primary text-on-primary"
+                        : "bg-surface-container text-on-surface-variant hover:text-primary"
+                    }`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            </header>
+
+            <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto px-6 py-4">
+              {visible.length === 0 ? (
                 <EmptyState
                   title={
                     error
                       ? "Alert feed unavailable"
                       : alerts.length === 0
-                      ? "No alerts"
-                      : "No alerts at this severity"
+                        ? "No alerts"
+                        : "No alerts of this type"
                   }
                   detail={
                     error
                       ? OFFLINE_HINT
                       : alerts.length === 0
-                      ? NO_DATA_HINT
-                      : undefined
+                        ? NO_DATA_HINT
+                        : undefined
                   }
-                  tone={
-                    error ? "error" : "neutral"
-                  }
+                  tone={error ? "error" : "neutral"}
                 />
               ) : (
-                filteredAlerts.map(
-                (alert) => (
-                  <AlertRow
-                    key={alert.id}
-                    alert={alert}
-                    selected={
-                      alert.id ===
-                      selectedAlert?.id
-                    }
-                    onClick={() =>
-                      setSelectedAlertId(
-                        alert.id
-                      )
-                    }
-                  />
-                )
-              ))}
-            </div>
-          </section>
-
-          {/* DETAILS */}
-
-          <aside
-            style={{
-              background: "#091828",
-              border:
-                "1px solid rgba(255,255,255,0.07)",
-              borderRadius: "16px",
-              padding: "16px",
-              alignSelf: "start",
-            }}
-          >
-            <div
-              style={{
-                fontSize: "10px",
-                textTransform: "uppercase",
-                color: "#64748b",
-                letterSpacing: "1px",
-              }}
-            >
-              Selected alert
-            </div>
-
-            {!selectedAlert && (
-              <EmptyState
-                title="Nothing selected"
-                detail="Pick an alert from the feed to see the sighting that triggered it."
-              />
-            )}
-
-            {selectedAlert && (
-            <>
-            <div
-              style={{
-                marginTop: "8px",
-                fontSize: "18px",
-                fontWeight: 700,
-                lineHeight: 1.35,
-              }}
-            >
-              {selectedAlert.title}
-            </div>
-
-            <SeverityBadge
-              severity={
-                selectedAlert.severity
-              }
-            />
-
-            <div
-              style={{
-                marginTop: "14px",
-                padding: "11px",
-                borderRadius: "9px",
-                background: "#0c1b2d",
-                color: "#8ba7c5",
-                fontSize: "11px",
-                lineHeight: 1.55,
-              }}
-            >
-              {
-                selectedAlert.description
-              }
-            </div>
-
-            <div
-              style={{
-                marginTop: "16px",
-                display: "flex",
-                flexDirection: "column",
-                gap: "10px",
-              }}
-            >
-              <Detail
-                label="Alert ID"
-                value={selectedAlert.id}
-              />
-
-              {selectedAlert.vehicle && (
-                <Detail
-                  label="Vehicle"
-                  value={
-                    selectedAlert.vehicle
-                  }
-                />
-              )}
-
-              {selectedAlert.camera && (
-                <Detail
-                  label="Camera"
-                  value={
-                    selectedAlert.camera
-                  }
-                />
-              )}
-
-              {selectedAlert.zone && (
-                <Detail
-                  label="Zone"
-                  value={
-                    selectedAlert.zone
-                  }
-                />
-              )}
-
-              <Detail
-                label="Time"
-                value={
-                  selectedAlert.time
-                }
-              />
-
-              {selectedAlert.confidence && (
-                <Detail
-                  label="Confidence"
-                  value={
-                    selectedAlert.confidence
-                  }
-                />
+                <div className="flex flex-col gap-3">
+                  {visible.map((alert) => (
+                    <AlertCard
+                      key={alert.alert_id}
+                      alert={alert}
+                      expanded={alert.alert_id === selectedId}
+                      onToggle={() =>
+                        setSelectedId((current) =>
+                          current === alert.alert_id
+                            ? null
+                            : alert.alert_id
+                        )
+                      }
+                    />
+                  ))}
+                </div>
               )}
             </div>
-
-            {selectedAlert.vehicle && (
-              <button
-                style={{
-                  marginTop: "18px",
-                  width: "100%",
-                  height: "40px",
-                  border: "none",
-                  borderRadius: "9px",
-                  background: "#2563eb",
-                  color: "white",
-                  cursor: "pointer",
-                  fontWeight: 650,
-                }}
-              >
-                Investigate Vehicle
-              </button>
-            )}
-            </>
-            )}
-          </aside>
-        </div>
-      </main>
-    </div>
+          </SidePanel>
+        }
+        overlays={
+          <FloatingCard className="absolute bottom-6 left-[452px] z-20 w-56">
+            <Label>Last 60 minutes</Label>
+            <div className="mt-2 flex items-baseline gap-2">
+              <span className="font-display text-headline-md text-on-surface">
+                {lastHour.length}
+              </span>
+              <span className="font-body text-[12px] text-on-surface-variant">
+                Alerts
+              </span>
+            </div>
+            <Sparkline points={rateSeries} height={40} className="mt-2" />
+          </FloatingCard>
+        }
+      />
+    </AppShell>
   );
 }
 
-// =====================================
-// KPI
-// =====================================
+// ---------------------------------------------------------------------
 
-function AlertKpi({
-  label,
-  value,
-  color,
-}: {
-  label: string;
-  value: string;
-  color: string;
-}) {
-  return (
-    <div
-      style={{
-        background: "#091828",
-        border:
-          "1px solid rgba(255,255,255,0.07)",
-        borderRadius: "13px",
-        padding: "14px 16px",
-      }}
-    >
-      <div
-        style={{
-          fontSize: "11px",
-          color: "#8ba7c5",
-        }}
-      >
-        {label}
-      </div>
-
-      <div
-        style={{
-          marginTop: "7px",
-          fontSize: "24px",
-          fontWeight: 750,
-          color,
-        }}
-      >
-        {value}
-      </div>
-    </div>
-  );
-}
-
-// =====================================
-// ALERT ROW
-// =====================================
-
-function AlertRow({
+function AlertCard({
   alert,
-  selected,
-  onClick,
+  expanded,
+  onToggle,
 }: {
-  alert: AlertItem;
-  selected: boolean;
-  onClick: () => void;
+  alert: AlertSummary;
+  expanded: boolean;
+  onToggle: () => void;
 }) {
-  const color =
-    getSeverityColor(
-      alert.severity
-    );
+  const tone = severity(alert.severity);
+
+  // Detail is fetched only when a card is opened — the feed does not
+  // need N+1 requests to render.
+  const { data: detail } = useApiData<AlertDetail | null>(
+    (signal) => (expanded ? getAlert(alert.alert_id, signal) : Promise.resolve(null)),
+    [expanded, alert.alert_id]
+  );
 
   return (
-    <button
-      onClick={onClick}
-      style={{
-        width: "100%",
-        textAlign: "left",
-        background: selected
-          ? "rgba(37,99,235,.12)"
-          : "#0c1b2d",
-        borderRadius: "10px",
-        padding: "13px",
-        border: selected
-          ? "1px solid rgba(96,165,250,.30)"
-          : "1px solid transparent",
-        borderLeft: `3px solid ${color}`,
-        color: "white",
-        cursor: "pointer",
-      }}
+    <article
+      className="overflow-hidden rounded-[16px] bg-surface-container-low"
+      style={{ borderLeft: `3px solid ${tone.hex}` }}
     >
-      <div
-        style={{
-          display: "flex",
-          justifyContent:
-            "space-between",
-          gap: "12px",
-        }}
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full px-4 py-3 text-left"
       >
-        <div
-          style={{
-            fontSize: "13px",
-            fontWeight: 650,
-          }}
-        >
-          {alert.title}
+        <div className="flex items-baseline justify-between gap-3">
+          <span
+            className="font-body text-label-caps uppercase"
+            style={{ color: tone.hex }}
+          >
+            {alertTypeLabel(alert.alert_type)}
+          </span>
+          <span className="shrink-0 font-body text-[11px] text-on-surface-variant">
+            {agoLabel(alert.occurred_at)}
+          </span>
+        </div>
 
-          {alert.repeatCount > 1 && (
-            <span
-              style={{
-                marginLeft: "7px",
-                padding: "1px 6px",
-                borderRadius: "999px",
-                background: "rgba(148,163,184,.16)",
-                color: "#cbd5e1",
-                fontSize: "10px",
-                fontWeight: 700,
-              }}
-              title="Repeat sightings collapsed into one alert"
-            >
-              ×{alert.repeatCount}
+        <p className="mt-1.5 font-body text-[13px] leading-relaxed text-on-surface">
+          {alert.message}
+        </p>
+
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {alert.plate && (
+            <Chip className="bg-surface-container font-body tracking-wider text-on-surface">
+              {alert.plate}
+            </Chip>
+          )}
+          {alert.camera_name && (
+            <span className="font-body text-[11px] text-on-surface-variant">
+              {alert.camera_id} · {alert.camera_name}
             </span>
           )}
+          {/* Repeats inside the suppression window collapse into one
+              row, so the count is the signal, not a duplicate feed. */}
+          {alert.repeat_count > 1 && (
+            <Chip className="bg-secondary-container text-on-secondary-container">
+              ×{alert.repeat_count}
+            </Chip>
+          )}
         </div>
+      </button>
 
-        <div
-          style={{
-            fontSize: "9px",
-            color,
-            textTransform:
-              "uppercase",
-            fontWeight: 700,
-          }}
-        >
-          {alert.severity}
+      {expanded && detail && (
+        <div className="hairline-t px-4 py-3">
+          {detail.vehicle && detail.related_vehicle ? (
+            <>
+              <Label>Two vehicles wearing this plate</Label>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <VehicleFace
+                  title="Vehicle 1"
+                  vehicle={detail.vehicle}
+                />
+                <VehicleFace
+                  title="Vehicle 2"
+                  vehicle={detail.related_vehicle}
+                />
+              </div>
+
+              {/* Why the resolver refused to call these one vehicle:
+                  the plates match exactly, but the appearance vectors
+                  do not, so the total never cleared the threshold. */}
+              <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 font-body text-[12px] text-on-surface-variant">
+                {typeof detail.alert.metadata?.cosine_similarity ===
+                  "number" && (
+                  <span>
+                    Appearance similarity:{" "}
+                    <strong className="text-on-surface">
+                      {(
+                        detail.alert.metadata
+                          .cosine_similarity as number
+                      ).toFixed(2)}
+                    </strong>
+                  </span>
+                )}
+                {typeof detail.alert.metadata?.total_score ===
+                  "number" && (
+                  <span>
+                    Link score:{" "}
+                    <strong className="text-error">
+                      {(
+                        detail.alert.metadata.total_score as number
+                      ).toFixed(1)}
+                    </strong>{" "}
+                    — below threshold
+                  </span>
+                )}
+              </div>
+            </>
+          ) : (
+            detail.vehicle && (
+              <>
+                <Label>Vehicle</Label>
+                <div className="mt-2">
+                  <VehicleFace title="" vehicle={detail.vehicle} />
+                </div>
+              </>
+            )
+          )}
+
+          {detail.observation && (
+            <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 font-body text-[11px] text-on-surface-variant">
+              <span>
+                Read:{" "}
+                <strong className="text-on-surface">
+                  {detail.observation.plate_text ?? "unreadable"}
+                </strong>
+              </span>
+              <span>
+                Confidence:{" "}
+                {percent(detail.observation.plate_confidence)}
+              </span>
+              {detail.observation.vehicle_colour && (
+                <span>
+                  {detail.observation.vehicle_colour}{" "}
+                  {detail.observation.vehicle_type}
+                </span>
+              )}
+            </div>
+          )}
+
+          {/* Drill-down: open the journey of the vehicle this alert
+              names. A clone alert offers both. */}
+          {detail.vehicle?.canonical_plate && (
+            <div className="mt-3 flex gap-2">
+              <Link
+                to={`/vehicles?plate=${encodeURIComponent(
+                  detail.vehicle.canonical_plate
+                )}`}
+                className="ambient-shadow inline-flex flex-1 items-center justify-center gap-2 rounded-full bg-primary-container px-4 py-2.5 font-body text-label-caps uppercase text-on-primary-container transition-colors hover:bg-primary"
+              >
+                <Icon name="timeline" size={14} />
+                {detail.related_vehicle
+                  ? "Journey 1"
+                  : "Open journey"}
+              </Link>
+
+              {detail.related_vehicle?.canonical_plate && (
+                <Link
+                  to={`/vehicles?plate=${encodeURIComponent(
+                    detail.related_vehicle.canonical_plate
+                  )}`}
+                  className="inline-flex flex-1 items-center justify-center gap-2 rounded-full ghost-border px-4 py-2.5 font-body text-label-caps uppercase text-primary transition-colors hover:bg-secondary-container/50"
+                >
+                  <Icon name="timeline" size={14} />
+                  Journey 2
+                </Link>
+              )}
+            </div>
+          )}
         </div>
-      </div>
-
-      <div
-        style={{
-          marginTop: "6px",
-          color: "#8ba7c5",
-          fontSize: "11px",
-          lineHeight: 1.5,
-        }}
-      >
-        {alert.description}
-      </div>
-
-      <div
-        style={{
-          marginTop: "9px",
-          display: "flex",
-          flexWrap: "wrap",
-          gap: "12px",
-          fontSize: "9px",
-          color: "#64748b",
-        }}
-      >
-        {alert.vehicle && (
-          <span>
-            Vehicle:{" "}
-            {alert.vehicle}
-          </span>
-        )}
-
-        {alert.camera && (
-          <span>
-            Camera:{" "}
-            {alert.camera}
-          </span>
-        )}
-
-        <span>
-          {alert.time}
-        </span>
-      </div>
-    </button>
+      )}
+    </article>
   );
 }
 
-// =====================================
-// SEVERITY
-// =====================================
-
-function SeverityBadge({
-  severity,
+function VehicleFace({
+  title,
+  vehicle,
 }: {
-  severity: Severity;
-}) {
-  const color =
-    getSeverityColor(
-      severity
-    );
-
-  return (
-    <div
-      style={{
-        display: "inline-block",
-        marginTop: "10px",
-        padding: "5px 8px",
-        borderRadius: "20px",
-        background: `${color}20`,
-        color,
-        fontSize: "9px",
-        fontWeight: 700,
-        textTransform: "uppercase",
-      }}
-    >
-      {severity}
-    </div>
-  );
-}
-
-function getSeverityColor(
-  severity: Severity
-) {
-  if (severity === "high") {
-    return "#ef4444";
-  }
-
-  if (severity === "medium") {
-    return "#f97316";
-  }
-
-  return "#f59e0b";
-}
-
-// =====================================
-// DETAIL
-// =====================================
-
-function Detail({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
+  title: string;
+  vehicle: NonNullable<AlertDetail["vehicle"]>;
 }) {
   return (
-    <div
-      style={{
-        padding: "10px",
-        background: "#0c1b2d",
-        borderRadius: "8px",
-      }}
-    >
-      <div
-        style={{
-          fontSize: "9px",
-          color: "#64748b",
-        }}
-      >
-        {label}
+    <div className="rounded-[8px] border border-hairline bg-surface-container-lowest/60 p-2.5">
+      {title && <Label className="text-[10px]">{title}</Label>}
+      <div className="mt-1 font-body text-[13px] font-semibold text-on-surface capitalize">
+        {[vehicle.vehicle_colour, vehicle.vehicle_type]
+          .filter(Boolean)
+          .join(" ") || `Vehicle ${vehicle.vehicle_id}`}
       </div>
-
-      <div
-        style={{
-          marginTop: "3px",
-          fontSize: "12px",
-          fontWeight: 600,
-        }}
-      >
-        {value}
+      <div className="mt-0.5 font-body text-[11px] text-on-surface-variant">
+        {vehicle.last_camera_id ?? "—"}
+      </div>
+      <div className="font-body text-[11px] text-on-surface-variant">
+        {agoLabel(vehicle.last_seen_at)}
       </div>
     </div>
   );

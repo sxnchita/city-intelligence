@@ -1,111 +1,359 @@
 import { useMemo, useState } from "react";
 
-import Sidebar from "../components/layout/Sidebar";
-import ConnectionBadge, {
-  connectionState,
-} from "../components/common/ConnectionBadge";
-import EmptyState, {
-  OFFLINE_HINT,
-} from "../components/common/EmptyState";
+import AppShell, { MapWorkspace } from "../components/layout/AppShell";
+import CityMap from "../components/map/CityMap";
+import { connectionState } from "../components/common/ConnectionBadge";
+import EmptyState, { OFFLINE_HINT } from "../components/common/EmptyState";
 import { useApiData } from "../hooks/useApiData";
-import { getCameras } from "../services/mapApi";
-import type { CameraCollection } from "../services/mapApi";
 import {
-  getSystemHealth,
-  type SystemHealth,
-} from "../services/systemApi";
+  Chip,
+  FloatingCard,
+  Icon,
+  Label,
+  Rule,
+  SidePanel,
+} from "../design/ui";
+import {
+  CAMERA_STATUS,
+  agoLabel,
+  cameraStatus,
+  compassLabel,
+  type CameraStatus,
+} from "../design/tokens";
+import { getCameras } from "../services/mapApi";
+import { getDensity } from "../services/analyticsApi";
+import { getSystemHealth, type SystemHealth } from "../services/systemApi";
 
-type CameraStatus =
-  | "online"
-  | "delayed"
-  | "silent";
+// =====================================================================
+// CAMERA HEALTH
+//
+// Is anything actually arriving, and from where. Health is derived
+// from each camera's own last_event_at against the thresholds the
+// design's legend states: reporting normally, no data over 2 minutes,
+// no data over 10 minutes.
+// =====================================================================
 
-type CameraItem = {
+const REFRESH_MS = 15_000;
+
+type CameraRow = {
   id: string;
   name: string;
   zone: string;
   heading: number;
-  lastSeen: string;
+  headingLabel: string | null;
+  lastEventAt: string | null;
   status: CameraStatus;
-  isActive: boolean;
+  events: number | null;
 };
 
-function formatLastSeen(
-  minutesOffline: number
-): string {
-  if (minutesOffline === 0)
-    return "< 1 min ago";
-  if (minutesOffline < 60)
-    return `${minutesOffline} min ago`;
-  return `${Math.floor(
-    minutesOffline / 60
-  )}h ago`;
-}
+type Filter = "all" | CameraStatus;
 
-/** Minutes since a timestamp; large when never seen. */
-function minutesSince(
-  timestamp: string | null
-): number {
-  if (!timestamp) {
-    return Number.MAX_SAFE_INTEGER;
-  }
+export default function CameraHealth() {
+  const [search, setSearch] = useState("");
+  const [zone, setZone] = useState("all");
+  const [filter, setFilter] = useState<Filter>("all");
+  const [streamOpen, setStreamOpen] = useState(false);
 
-  const seen = new Date(timestamp).getTime();
+  const {
+    data: fetched,
+    loading,
+    error,
+  } = useApiData<CameraRow[]>(
+    async (signal) => {
+      const [cameras, density] = await Promise.all([
+        getCameras(signal),
+        // Per-camera observation counts. /api/cameras carries no event
+        // count, but the density series is one per camera.
+        getDensity(undefined, undefined, undefined, signal),
+      ]);
 
-  if (Number.isNaN(seen)) {
-    return Number.MAX_SAFE_INTEGER;
-  }
+      const events = new Map<string, number>();
+      for (const series of density.series) {
+        if (series.camera_id === null) continue;
+        events.set(
+          series.camera_id,
+          series.points.reduce((sum, p) => sum + p.observation_count, 0)
+        );
+      }
 
-  return Math.max(
-    0,
-    Math.round((Date.now() - seen) / 60000)
+      return cameras.features.map((feature) => {
+        const p = feature.properties;
+        const minutes = minutesSince(p.last_event_at);
+
+        return {
+          id: p.camera_id,
+          name: p.name,
+          zone: p.zone,
+          heading: p.heading_degrees,
+          headingLabel: compassLabel(p.heading_degrees),
+          lastEventAt: p.last_event_at,
+          status: cameraStatus(minutes),
+          events: events.get(p.camera_id) ?? null,
+        };
+      });
+    },
+    [],
+    { refreshMs: REFRESH_MS }
+  );
+
+  const { data: health } = useApiData<SystemHealth>(
+    (signal) => getSystemHealth(signal),
+    [],
+    { refreshMs: REFRESH_MS }
+  );
+
+  const cameras = useMemo(() => fetched ?? [], [fetched]);
+
+  const counts = useMemo(() => {
+    const result = { healthy: 0, degraded: 0, offline: 0 };
+    for (const camera of cameras) result[camera.status] += 1;
+    return result;
+  }, [cameras]);
+
+  const zones = useMemo(
+    () => ["all", ...[...new Set(cameras.map((c) => c.zone))].sort()],
+    [cameras]
+  );
+
+  const visible = useMemo(() => {
+    const needle = search.trim().toLowerCase();
+    return cameras.filter(
+      (camera) =>
+        (!needle ||
+          camera.id.toLowerCase().includes(needle) ||
+          camera.name.toLowerCase().includes(needle)) &&
+        (zone === "all" || camera.zone === zone) &&
+        (filter === "all" || camera.status === filter)
+    );
+  }, [cameras, search, zone, filter]);
+
+  return (
+    <AppShell
+      connection={connectionState({ loading, error, stream: streamOpen })}
+      connectionTitle={error ? error.message : undefined}
+    >
+      <MapWorkspace
+        map={
+          <CityMap
+            showCameras
+            showTraffic={false}
+            showTrajectory={false}
+            onCameraClick={(id) => setSearch(id)}
+            onStreamChange={setStreamOpen}
+          />
+        }
+        panel={
+          <SidePanel width="w-[440px]">
+            <header className="hairline-b px-6 pt-6 pb-5">
+              <h1 className="font-display text-headline-md text-on-surface">
+                Camera Health
+              </h1>
+
+              <div className="mt-4 flex items-center gap-3">
+                <div className="flex flex-1 items-center gap-2 rounded-sm border-b border-outline-variant pb-1.5">
+                  <Icon
+                    name="search"
+                    size={15}
+                    className="text-on-surface-variant"
+                  />
+                  <input
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Camera or junction…"
+                    className="w-full bg-transparent font-body text-[13px] text-on-surface placeholder:text-on-surface-variant/60 focus:outline-none"
+                  />
+                </div>
+
+                <select
+                  value={zone}
+                  onChange={(e) => setZone(e.target.value)}
+                  className="border-b border-outline-variant bg-transparent pb-1.5 font-body text-[13px] text-on-surface focus:outline-none"
+                >
+                  {zones.map((z) => (
+                    <option key={z} value={z}>
+                      {z === "all" ? "All zones" : z}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="mt-4 flex flex-wrap gap-4">
+                {(
+                  ["healthy", "degraded", "offline"] as CameraStatus[]
+                ).map((status) => (
+                  <button
+                    key={status}
+                    type="button"
+                    onClick={() =>
+                      setFilter((current) =>
+                        current === status ? "all" : status
+                      )
+                    }
+                    className={`flex items-center gap-1.5 font-body text-[13px] transition-opacity ${
+                      filter === "all" || filter === status
+                        ? "opacity-100"
+                        : "opacity-40"
+                    }`}
+                  >
+                    <span
+                      className={`h-2 w-2 rounded-full ${CAMERA_STATUS[status].dot}`}
+                    />
+                    <span className={CAMERA_STATUS[status].text}>
+                      {counts[status]} {CAMERA_STATUS[status].label}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </header>
+
+            <div className="hairline-b grid grid-cols-[auto_1fr_auto] gap-4 px-6 py-2">
+              <Label className="text-[10px]">Status</Label>
+              <Label className="text-[10px]">Details</Label>
+              <Label className="text-[10px]">Events</Label>
+            </div>
+
+            <div className="hide-scrollbar min-h-0 flex-1 overflow-y-auto">
+              {visible.length === 0 ? (
+                <EmptyState
+                  title={
+                    error
+                      ? "Camera list unavailable"
+                      : cameras.length === 0
+                        ? "No cameras"
+                        : "No cameras match"
+                  }
+                  detail={
+                    error
+                      ? OFFLINE_HINT
+                      : cameras.length === 0
+                        ? "The backend reported no active cameras for this camera set."
+                        : undefined
+                  }
+                  tone={error ? "error" : "neutral"}
+                />
+              ) : (
+                visible.map((camera, index) => (
+                  <div key={camera.id}>
+                    {index > 0 && <Rule />}
+                    <CameraRowView camera={camera} />
+                  </div>
+                ))
+              )}
+            </div>
+
+            {health && (
+              <div className="hairline-t flex flex-wrap gap-x-5 gap-y-1 px-6 py-3 font-body text-[11px] text-on-surface-variant">
+                <Fact
+                  label="Observations"
+                  value={health.observation_count.toLocaleString()}
+                />
+                <Fact
+                  label="Last ingest"
+                  value={agoLabel(health.last_ingest_at)}
+                />
+                <Fact
+                  label="Rejected"
+                  value={health.reject_count.toLocaleString()}
+                  alarming={health.reject_count > 0}
+                />
+                {/* Failures that were caught and swallowed. A climbing
+                    counter means work is being lost silently. */}
+                {Object.entries(health.failures)
+                  .filter(([, n]) => n > 0)
+                  .map(([name, n]) => (
+                    <Fact
+                      key={name}
+                      label={name.replace(/_/g, " ")}
+                      value={String(n)}
+                      alarming
+                    />
+                  ))}
+              </div>
+            )}
+          </SidePanel>
+        }
+        overlays={
+          <FloatingCard className="absolute right-6 bottom-6 z-20 w-56">
+            <Label>Camera status</Label>
+            <div className="mt-3 flex flex-col gap-2.5">
+              {(["healthy", "degraded", "offline"] as CameraStatus[]).map(
+                (status) => (
+                  <div key={status} className="flex items-start gap-2.5">
+                    <span
+                      className={`mt-1 h-2 w-2 shrink-0 rounded-full ${CAMERA_STATUS[status].dot}`}
+                    />
+                    <div>
+                      <div className="font-body text-[12px] text-on-surface">
+                        {CAMERA_STATUS[status].label}
+                      </div>
+                      <div className="font-body text-[10px] text-on-surface-variant">
+                        {CAMERA_STATUS[status].hint}
+                      </div>
+                    </div>
+                  </div>
+                )
+              )}
+            </div>
+          </FloatingCard>
+        }
+      />
+    </AppShell>
   );
 }
 
-/**
- * Health is derived from the camera's own
- * last_event_at, which is what the backend
- * maintains as events arrive. A camera that has
- * gone quiet for a quarter of an hour is silent
- * whatever its is_active flag says.
- */
-function cameraStatus(
-  minutesOffline: number
-): CameraStatus {
-  if (minutesOffline <= 5) return "online";
-  if (minutesOffline <= 15) return "delayed";
-  return "silent";
+function CameraRowView({ camera }: { camera: CameraRow }) {
+  const tone = CAMERA_STATUS[camera.status];
+
+  // Degraded and offline rows are tinted, so a problem is visible
+  // while scrolling rather than only on inspection.
+  const tint =
+    camera.status === "offline"
+      ? "bg-error-container/25"
+      : camera.status === "degraded"
+        ? "bg-warning-container/25"
+        : "";
+
+  return (
+    <div
+      className={`grid grid-cols-[auto_1fr_auto] items-start gap-4 px-6 py-3 transition-colors hover:bg-secondary-container/30 ${tint}`}
+    >
+      <span className={`mt-2 h-2 w-2 rounded-full ${tone.dot}`} />
+
+      <div className="min-w-0">
+        <div
+          className={`font-body text-data ${
+            camera.status === "offline" ? "text-error" : "text-on-surface"
+          }`}
+        >
+          {camera.id}
+        </div>
+        <div className="font-body text-[13px] text-on-surface-variant">
+          {camera.name}
+        </div>
+        <div className="mt-1.5 flex items-center gap-2">
+          {camera.headingLabel && (
+            <Chip title={`${camera.heading}°`}>{camera.headingLabel}</Chip>
+          )}
+          <span
+            className={`font-body text-[11px] ${
+              camera.status === "healthy"
+                ? "text-on-surface-variant"
+                : tone.text
+            }`}
+          >
+            {agoLabel(camera.lastEventAt)}
+          </span>
+        </div>
+      </div>
+
+      <div className="text-right font-body text-[15px] text-on-surface tabular-nums">
+        {camera.events ?? "—"}
+      </div>
+    </div>
+  );
 }
 
-function toCameraItems(
-  collection: CameraCollection
-): CameraItem[] {
-  return collection.features.map((feature) => {
-    const p = feature.properties;
-    const offline = minutesSince(
-      p.last_event_at
-    );
-
-    return {
-      id: p.camera_id,
-      name: p.name,
-      zone: p.zone,
-      heading: p.heading_degrees,
-      lastSeen: p.last_event_at
-        ? formatLastSeen(offline)
-        : "never",
-      status: cameraStatus(offline),
-      isActive: p.is_active,
-    };
-  });
-}
-
-// Camera health only moves when events arrive, so
-// this polls on the same cadence as the rest of
-// live mode.
-const REFRESH_MS = 15_000;
-
-function IngestFact({
+function Fact({
   label,
   value,
   alarming = false,
@@ -116,881 +364,19 @@ function IngestFact({
 }) {
   return (
     <span>
-      <span
-        style={{
-          textTransform: "uppercase",
-          letterSpacing: ".5px",
-          fontSize: "10px",
-          color: "#64748b",
-        }}
-      >
+      <span className="uppercase tracking-wider text-[10px] text-on-surface-variant">
         {label}
       </span>{" "}
-      <strong
-        style={{
-          color: alarming
-            ? "#f87171"
-            : "#e2e8f0",
-        }}
-      >
+      <strong className={alarming ? "text-error" : "text-on-surface"}>
         {value}
       </strong>
     </span>
   );
 }
 
-type StatusFilter = "all" | CameraStatus;
-
-export default function CameraHealth() {
-  const {
-    data: fetchedCameras,
-    loading,
-    error,
-  } = useApiData<CameraItem[]>(
-    async (signal) =>
-      toCameraItems(
-        await getCameras(signal)
-      ),
-    [],
-    { refreshMs: REFRESH_MS }
-  );
-
-  const cameras = useMemo(
-    () => fetchedCameras ?? [],
-    [fetchedCameras]
-  );
-
-  // "Is anything actually arriving?" -- the counters
-  // the ingest path maintains, including failures
-  // that were caught and swallowed.
-  const { data: health } =
-    useApiData<SystemHealth>(
-      (signal) => getSystemHealth(signal),
-      [],
-      { refreshMs: REFRESH_MS }
-    );
-
-  // Zones come from whatever the backend is
-  // serving, so this page follows the city.
-  const zones = useMemo(
-    () => [
-      "all",
-      ...Array.from(
-        new Set(cameras.map((c) => c.zone))
-      ).sort(),
-    ],
-    [cameras]
-  );
-
-  const [searchValue, setSearchValue] =
-    useState("");
-
-  const [zoneFilter, setZoneFilter] =
-    useState<string>("all");
-
-  const [statusFilter, setStatusFilter] =
-    useState<StatusFilter>("all");
-
-  const filteredCameras =
-    useMemo(() => {
-      const search =
-        searchValue
-          .trim()
-          .toLowerCase();
-
-      return cameras.filter(
-        (camera) => {
-          const matchesSearch =
-            !search ||
-            camera.id
-              .toLowerCase()
-              .includes(search) ||
-            camera.name
-              .toLowerCase()
-              .includes(search) ||
-            camera.zone
-              .toLowerCase()
-              .includes(search);
-
-          const matchesZone =
-            zoneFilter === "all" ||
-            camera.zone === zoneFilter;
-
-          const matchesStatus =
-            statusFilter === "all" ||
-            camera.status ===
-              statusFilter;
-
-          return (
-            matchesSearch &&
-            matchesZone &&
-            matchesStatus
-          );
-        }
-      );
-    }, [
-      cameras,
-      searchValue,
-      zoneFilter,
-      statusFilter,
-    ]);
-
-  const onlineCount =
-    cameras.filter(
-      (camera) =>
-        camera.status === "online"
-    ).length;
-
-  const delayedCount =
-    cameras.filter(
-      (camera) =>
-        camera.status === "delayed"
-    ).length;
-
-  const silentCount =
-    cameras.filter(
-      (camera) =>
-        camera.status === "silent"
-    ).length;
-
-  const attentionCamera =
-    cameras.find(
-      (camera) =>
-        camera.status === "silent"
-    );
-
-  return (
-    <div
-      style={{
-        width: "100%",
-        minHeight: "100vh",
-        background: "#07111f",
-        color: "white",
-        display: "flex",
-        fontFamily:
-          "Inter, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-      }}
-    >
-      <Sidebar />
-
-      <main
-        style={{
-          flex: 1,
-          minWidth: 0,
-          padding: "18px",
-        }}
-      >
-        {/* HEADER */}
-
-        <div
-          style={{
-            display: "flex",
-            justifyContent:
-              "space-between",
-            alignItems: "center",
-            gap: "16px",
-            marginBottom: "16px",
-          }}
-        >
-          <div>
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: "10px",
-              }}
-            >
-              <div
-                style={{
-                  fontSize: "24px",
-                  fontWeight: 750,
-                }}
-              >
-                Camera Health
-              </div>
-
-              <ConnectionBadge
-                state={connectionState({
-                  loading,
-                  error,
-                })}
-                title={
-                  error ? error.message : undefined
-                }
-              />
-            </div>
-
-            <div
-              style={{
-                marginTop: "4px",
-                fontSize: "12px",
-                color: "#7f9dbd",
-              }}
-            >
-              Monitor camera availability, reporting activity and system health
-            </div>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              gap: "8px",
-            }}
-          >
-            <select
-              value={zoneFilter}
-              onChange={(event) =>
-                setZoneFilter(
-                  event.target.value
-                )
-              }
-              style={{
-                height: "40px",
-                borderRadius: "10px",
-                border:
-                  "1px solid rgba(148,163,184,.16)",
-                background: "#0c1b2d",
-                color: "white",
-                padding: "0 12px",
-                outline: "none",
-              }}
-            >
-              {zones.map((z) => (
-                <option key={z} value={z}>
-                  {z === "all" ? "All zones" : z}
-                </option>
-              ))}
-            </select>
-
-            <select
-              value={statusFilter}
-              onChange={(event) =>
-                setStatusFilter(
-                  event.target
-                    .value as StatusFilter
-                )
-              }
-              style={{
-                height: "40px",
-                borderRadius: "10px",
-                border:
-                  "1px solid rgba(148,163,184,.16)",
-                background: "#0c1b2d",
-                color: "white",
-                padding: "0 12px",
-                outline: "none",
-              }}
-            >
-              <option value="all">
-                All statuses
-              </option>
-
-              <option value="online">
-                Online
-              </option>
-
-              <option value="delayed">
-                Delayed
-              </option>
-
-              <option value="silent">
-                Silent
-              </option>
-            </select>
-          </div>
-        </div>
-
-        {/* KPIs */}
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns:
-              "repeat(4, minmax(0,1fr))",
-            gap: "10px",
-            marginBottom: "14px",
-          }}
-        >
-          <HealthKpi
-            label="Total Cameras"
-            value={String(
-              cameras.length
-            )}
-            color="#60a5fa"
-          />
-
-          <HealthKpi
-            label="Online"
-            value={String(
-              onlineCount
-            )}
-            color="#22c55e"
-          />
-
-          <HealthKpi
-            label="Delayed"
-            value={String(
-              delayedCount
-            )}
-            color="#f59e0b"
-          />
-
-          <HealthKpi
-            label="Silent"
-            value={String(
-              silentCount
-            )}
-            color="#94a3b8"
-          />
-        </div>
-
-        {/* INGEST HEALTH */}
-
-        {health && (
-          <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: "18px",
-              alignItems: "baseline",
-              background: "#091828",
-              border:
-                "1px solid rgba(255,255,255,0.07)",
-              borderRadius: "13px",
-              padding: "12px 16px",
-              marginBottom: "14px",
-              fontSize: "11px",
-              color: "#94a3b8",
-            }}
-          >
-            <IngestFact
-              label="Observations"
-              value={health.observation_count.toLocaleString()}
-            />
-
-            <IngestFact
-              label="Last ingest"
-              value={
-                health.last_ingest_at
-                  ? formatLastSeen(
-                      minutesSince(
-                        health.last_ingest_at
-                      )
-                    )
-                  : "never"
-              }
-            />
-
-            <IngestFact
-              label="Rejected events"
-              value={health.reject_count.toLocaleString()}
-              alarming={health.reject_count > 0}
-            />
-
-            {/* A climbing counter here means work is
-                being lost silently, which is worth
-                showing even when nothing looks wrong. */}
-            {Object.entries(
-              health.failures
-            )
-              .filter(([, n]) => n > 0)
-              .map(([name, n]) => (
-                <IngestFact
-                  key={name}
-                  label={name.replace(
-                    /_/g,
-                    " "
-                  )}
-                  value={String(n)}
-                  alarming
-                />
-              ))}
-          </div>
-        )}
-
-        {/* MAIN CONTENT */}
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns:
-              "minmax(0,1fr) 320px",
-            gap: "12px",
-          }}
-        >
-          {/* CAMERA TABLE */}
-
-          <section
-            style={{
-              background: "#091828",
-              border:
-                "1px solid rgba(255,255,255,0.07)",
-              borderRadius: "16px",
-              padding: "16px",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent:
-                  "space-between",
-                gap: "14px",
-                marginBottom: "14px",
-              }}
-            >
-              <div>
-                <div
-                  style={{
-                    fontSize: "15px",
-                    fontWeight: 700,
-                  }}
-                >
-                  Camera Status
-                </div>
-
-                <div
-                  style={{
-                    marginTop: "4px",
-                    fontSize: "10px",
-                    color: "#64748b",
-                  }}
-                >
-                  Showing{" "}
-                  {
-                    filteredCameras.length
-                  }{" "}
-                  camera
-                  {filteredCameras.length ===
-                  1
-                    ? ""
-                    : "s"}
-                </div>
-              </div>
-
-              <input
-                value={searchValue}
-                onChange={(event) =>
-                  setSearchValue(
-                    event.target.value
-                  )
-                }
-                placeholder="Search camera, ID or zone..."
-                style={{
-                  width: "230px",
-                  height: "36px",
-                  borderRadius: "9px",
-                  border:
-                    "1px solid rgba(148,163,184,.14)",
-                  background: "#0c1b2d",
-                  color: "white",
-                  padding: "0 11px",
-                  outline: "none",
-                  fontSize: "11px",
-                }}
-              />
-            </div>
-
-            {/* TABLE HEADER */}
-
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns:
-                  ".7fr 1.4fr 1.1fr .7fr 1fr .8fr",
-                gap: "10px",
-                padding: "9px 8px",
-                color: "#64748b",
-                fontSize: "9px",
-                textTransform:
-                  "uppercase",
-                letterSpacing: ".5px",
-              }}
-            >
-              <div>ID</div>
-              <div>Camera</div>
-              <div>Zone</div>
-              <div>Heading</div>
-              <div>Last Seen</div>
-              <div>Status</div>
-            </div>
-
-            {filteredCameras.length >
-            0 ? (
-              filteredCameras.map(
-                (camera) => (
-                  <CameraRow
-                    key={camera.id}
-                    {...camera}
-                  />
-                )
-              )
-            ) : (
-              <EmptyState
-                title={
-                  error
-                    ? "Camera list unavailable"
-                    : cameras.length === 0
-                    ? "No cameras"
-                    : "No cameras match the current filters"
-                }
-                detail={
-                  error
-                    ? OFFLINE_HINT
-                    : cameras.length === 0
-                    ? "The backend reported no active cameras for this camera set."
-                    : undefined
-                }
-                tone={
-                  error ? "error" : "neutral"
-                }
-              />
-            )}
-          </section>
-
-          {/* HEALTH RULES */}
-
-          <aside
-            style={{
-              background: "#091828",
-              border:
-                "1px solid rgba(255,255,255,0.07)",
-              borderRadius: "16px",
-              padding: "16px",
-              alignSelf: "start",
-            }}
-          >
-            <div
-              style={{
-                fontSize: "15px",
-                fontWeight: 700,
-              }}
-            >
-              Health Rules
-            </div>
-
-            <div
-              style={{
-                marginTop: "4px",
-                fontSize: "10px",
-                color: "#64748b",
-              }}
-            >
-              Status derived from last_seen_at
-            </div>
-
-            <div
-              style={{
-                marginTop: "16px",
-                display: "flex",
-                flexDirection: "column",
-                gap: "10px",
-              }}
-            >
-              <RuleCard
-                color="#22c55e"
-                title="Online"
-                description="Camera reported within the last 5 minutes."
-              />
-
-              <RuleCard
-                color="#f59e0b"
-                title="Delayed"
-                description="Last report was between 5 and 15 minutes ago."
-              />
-
-              <RuleCard
-                color="#94a3b8"
-                title="Silent"
-                description="No camera report for more than 15 minutes."
-              />
-            </div>
-
-            <div
-              style={{
-                margin: "20px 0",
-                borderTop:
-                  "1px solid rgba(255,255,255,.07)",
-              }}
-            />
-
-            <div
-              style={{
-                fontSize: "14px",
-                fontWeight: 700,
-              }}
-            >
-              Attention Required
-            </div>
-
-            {attentionCamera ? (
-              <div
-                style={{
-                  marginTop: "12px",
-                  padding: "12px",
-                  borderRadius: "10px",
-                  background: "#0c1b2d",
-                  borderLeft:
-                    "3px solid #94a3b8",
-                }}
-              >
-                <div
-                  style={{
-                    fontSize: "12px",
-                    fontWeight: 650,
-                  }}
-                >
-                  {attentionCamera.id} ·{" "}
-                  {
-                    attentionCamera.name
-                  }
-                </div>
-
-                <div
-                  style={{
-                    marginTop: "5px",
-                    fontSize: "10px",
-                    color: "#8ba7c5",
-                    lineHeight: 1.5,
-                  }}
-                >
-                  Camera has not reported for{" "}
-                  {
-                    attentionCamera.lastSeen
-                  }.
-                </div>
-
-                <button
-                  style={{
-                    marginTop: "10px",
-                    width: "100%",
-                    height: "34px",
-                    border: "none",
-                    borderRadius: "8px",
-                    background: "#1e293b",
-                    color: "#cbd5e1",
-                    cursor: "pointer",
-                    fontSize: "10px",
-                    fontWeight: 600,
-                  }}
-                >
-                  View Camera Details
-                </button>
-              </div>
-            ) : (
-              <div
-                style={{
-                  marginTop: "12px",
-                  color: "#64748b",
-                  fontSize: "10px",
-                }}
-              >
-                No silent cameras.
-              </div>
-            )}
-          </aside>
-        </div>
-      </main>
-    </div>
-  );
-}
-
-// =====================================
-// KPI
-// =====================================
-
-function HealthKpi({
-  label,
-  value,
-  color,
-}: {
-  label: string;
-  value: string;
-  color: string;
-}) {
-  return (
-    <div
-      style={{
-        background: "#091828",
-        border:
-          "1px solid rgba(255,255,255,0.07)",
-        borderRadius: "13px",
-        padding: "14px 16px",
-      }}
-    >
-      <div
-        style={{
-          fontSize: "11px",
-          color: "#8ba7c5",
-        }}
-      >
-        {label}
-      </div>
-
-      <div
-        style={{
-          marginTop: "7px",
-          fontSize: "24px",
-          fontWeight: 750,
-          color,
-        }}
-      >
-        {value}
-      </div>
-    </div>
-  );
-}
-
-// =====================================
-// CAMERA ROW
-// =====================================
-
-function CameraRow({
-  id,
-  name,
-  zone,
-  heading,
-  lastSeen,
-  status,
-}: CameraItem) {
-  return (
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns:
-          ".7fr 1.4fr 1.1fr .7fr 1fr .8fr",
-        gap: "10px",
-        padding: "13px 8px",
-        borderTop:
-          "1px solid rgba(255,255,255,.05)",
-        alignItems: "center",
-        fontSize: "11px",
-      }}
-    >
-      <div
-        style={{
-          color: "#93c5fd",
-          fontWeight: 650,
-        }}
-      >
-        {id}
-      </div>
-
-      <div
-        style={{
-          fontWeight: 600,
-        }}
-      >
-        {name}
-      </div>
-
-      <div
-        style={{
-          color: "#94a3b8",
-        }}
-      >
-        {zone}
-      </div>
-
-      <div
-        style={{
-          color: "#94a3b8",
-        }}
-      >
-        {heading}°
-      </div>
-
-      <div
-        style={{
-          color: "#94a3b8",
-        }}
-      >
-        {lastSeen}
-      </div>
-
-      <StatusBadge
-        status={status}
-      />
-    </div>
-  );
-}
-
-// =====================================
-// STATUS BADGE
-// =====================================
-
-function StatusBadge({
-  status,
-}: {
-  status: CameraStatus;
-}) {
-  const color =
-    status === "online"
-      ? "#22c55e"
-      : status === "delayed"
-      ? "#f59e0b"
-      : "#94a3b8";
-
-  return (
-    <span
-      style={{
-        width: "fit-content",
-        padding: "5px 8px",
-        borderRadius: "20px",
-        background: `${color}18`,
-        color,
-        fontSize: "9px",
-        fontWeight: 700,
-        textTransform: "uppercase",
-      }}
-    >
-      {status}
-    </span>
-  );
-}
-
-// =====================================
-// RULE CARD
-// =====================================
-
-function RuleCard({
-  color,
-  title,
-  description,
-}: {
-  color: string;
-  title: string;
-  description: string;
-}) {
-  return (
-    <div
-      style={{
-        padding: "11px",
-        borderRadius: "9px",
-        background: "#0c1b2d",
-        borderLeft: `3px solid ${color}`,
-      }}
-    >
-      <div
-        style={{
-          fontSize: "11px",
-          fontWeight: 650,
-          color,
-        }}
-      >
-        {title}
-      </div>
-
-      <div
-        style={{
-          marginTop: "4px",
-          fontSize: "10px",
-          lineHeight: 1.45,
-          color: "#7f9dbd",
-        }}
-      >
-        {description}
-      </div>
-    </div>
-  );
+function minutesSince(timestamp: string | null): number {
+  if (!timestamp) return Number.MAX_SAFE_INTEGER;
+  const seen = new Date(timestamp).getTime();
+  if (Number.isNaN(seen)) return Number.MAX_SAFE_INTEGER;
+  return Math.max(0, (Date.now() - seen) / 60000);
 }

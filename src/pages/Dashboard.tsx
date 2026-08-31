@@ -1,16 +1,24 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 
-import Sidebar from "../components/layout/Sidebar";
+import AppShell, { MapWorkspace } from "../components/layout/AppShell";
 import CityMap from "../components/map/CityMap";
-import ConnectionBadge, {
-  connectionState,
-} from "../components/common/ConnectionBadge";
+import { connectionState } from "../components/common/ConnectionBadge";
 import DemoControl from "../components/common/DemoControl";
 import EmptyState, {
   NO_DATA_HINT,
   OFFLINE_HINT,
 } from "../components/common/EmptyState";
 import { useApiData } from "../hooks/useApiData";
+import {
+  Chip,
+  FloatingCard,
+  Icon,
+  Label,
+  Rule,
+  SidePanel,
+} from "../design/ui";
+import { clockTime, percent, severity } from "../design/tokens";
 import { getSummary } from "../services/analyticsApi";
 import {
   alertTypeLabel,
@@ -19,6 +27,16 @@ import {
 } from "../services/alertsApi";
 import { getRecentObservations } from "../services/observationsApi";
 import { getCameras } from "../services/mapApi";
+
+// =====================================================================
+// DASHBOARD
+//
+// The glanceable screen: city map behind, a rail of live figures and
+// feeds in front. Statistics are set as editorial figures rather than
+// filled KPI cards — the design has no card fill anywhere.
+// =====================================================================
+
+const REFRESH_MS = 15_000;
 
 type DashboardAlert = {
   severity: Severity;
@@ -39,801 +57,344 @@ type DashboardData = {
   activeCameras: number;
   camerasReporting: number;
   /**
-   * Sightings, not distinct vehicles: the backend's
-   * unique_vehicles is summed over per-camera
-   * buckets, so it counts a vehicle once per camera
-   * per bucket. Labelled accordingly.
+   * Sightings, not distinct vehicles: the backend's unique_vehicles is
+   * summed over per-camera buckets, so it counts a vehicle once per
+   * camera per bucket. Labelled accordingly.
    */
   sightingCount: number;
   activeAlerts: number;
   highAlerts: number;
-  /** Congestion ratio of the worst edge, e.g. "2.09x". */
   worstRatio: string;
   worstEdge: string;
   alerts: DashboardAlert[];
   sightings: DashboardSighting[];
 };
 
-function clockTime(value: string): string {
-  const date = new Date(value);
-
-  return Number.isNaN(date.getTime())
-    ? value
-    : date.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-}
-
-function percent(
-  value: number | null
-): string {
-  return value === null
-    ? "\u2014"
-    : `${Math.round(value * 100)}%`;
-}
-
-// What an empty database looks like. Every number is
-// a real zero, not a placeholder standing in for one.
 const NOTHING_YET: DashboardData = {
   activeCameras: 0,
   camerasReporting: 0,
   sightingCount: 0,
   activeAlerts: 0,
   highAlerts: 0,
-  worstRatio: "\u2014",
+  worstRatio: "—",
   worstEdge: "No corridor ranked yet",
   alerts: [],
   sightings: [],
 };
 
-// Live mode: the analytics endpoints default to the
-// last 15 minutes when called with no range, so a
-// poll on that cadence is what "live" means here.
-const REFRESH_MS = 15_000;
-
 export default function Dashboard() {
+  const [streamOpen, setStreamOpen] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
+  const [lastEvent, setLastEvent] = useState("Waiting for live stream");
+
   const {
     data: fetched,
     loading,
     error,
   } = useApiData<DashboardData>(
-      async (signal) => {
-        const [
-          summary,
-          alerts,
-          recent,
-          cameras,
-        ] = await Promise.all([
-          getSummary(
-            undefined,
-            undefined,
-            signal
-          ),
-          getAlerts({ limit: 4 }, signal),
-          getRecentObservations(
-            5,
-            undefined,
-            signal
-          ),
-          getCameras(signal),
-        ]);
+    async (signal) => {
+      const [summary, alerts, recent, cameras] = await Promise.all([
+        getSummary(undefined, undefined, signal),
+        getAlerts({ limit: 4 }, signal),
+        getRecentObservations(5, undefined, signal),
+        getCameras(signal),
+      ]);
 
-        // /api/events/recent carries camera ids
-        // but not names or zones; the camera
-        // response is where those live.
-        const byId = new Map(
-          cameras.features.map((f) => [
-            f.properties.camera_id,
-            f.properties,
-          ])
-        );
+      // /api/events/recent carries camera ids but not names or zones;
+      // the camera response is where those live.
+      const byId = new Map(
+        cameras.features.map((f) => [
+          f.properties.camera_id,
+          f.properties,
+        ])
+      );
 
-        const bySeverity =
-          summary.alerts_by_severity ?? {};
+      const bySeverity = summary.alerts_by_severity ?? {};
+      const activeAlerts = Object.values(bySeverity).reduce(
+        (a, b) => a + b,
+        0
+      );
+      const worst = summary.worst_congested_edge;
 
-        const activeAlerts = Object.values(
-          bySeverity
-        ).reduce((a, b) => a + b, 0);
+      return {
+        activeCameras: cameras.features.filter(
+          (f) => f.properties.is_active
+        ).length,
+        camerasReporting: summary.active_cameras_reporting,
+        sightingCount: summary.total_observations,
+        activeAlerts,
+        highAlerts: bySeverity.high ?? 0,
+        worstRatio:
+          worst?.congestion_ratio != null
+            ? `${worst.congestion_ratio.toFixed(2)}×`
+            : "—",
+        worstEdge: worst
+          ? `${worst.from_camera_id} → ${worst.to_camera_id} · ${
+              worst.congestion_band ?? "unbanded"
+            }`
+          : "No corridor ranked yet",
 
-        const worst =
-          summary.worst_congested_edge;
+        alerts: alerts.map((row) => ({
+          severity: row.severity,
+          title: alertTypeLabel(row.alert_type),
+          description: row.message,
+          time: clockTime(row.occurred_at),
+        })),
 
-        return {
-          activeCameras:
-            cameras.features.filter(
-              (f) => f.properties.is_active
-            ).length,
-          camerasReporting:
-            summary.active_cameras_reporting,
-          sightingCount:
-            summary.total_observations,
-          activeAlerts,
-          highAlerts: bySeverity.high ?? 0,
-          // The count of severe corridors was a poor
-          // headline: a city with one badly congested
-          // corridor and none at "severe" showed a
-          // zero. The ratio is the number that
-          // actually says how bad the worst one is.
-          worstRatio:
-            worst?.congestion_ratio != null
-              ? `${worst.congestion_ratio.toFixed(2)}\u00d7`
-              : "\u2014",
-          worstEdge: worst
-            ? `${worst.from_camera_id} \u2192 ${worst.to_camera_id} \u00b7 ${
-                worst.congestion_band ?? "unbanded"
-              }`
-            : "No corridor ranked yet",
+        sightings: recent.map((row) => {
+          const camera = byId.get(row.camera_id);
+          return {
+            vehicle: row.plate_text ?? "unreadable",
+            camera: camera
+              ? `${row.camera_id} · ${camera.name}`
+              : row.camera_id,
+            zone: camera?.zone ?? "—",
+            time: clockTime(row.first_seen_at),
+            confidence: percent(row.plate_confidence),
+          };
+        }),
+      };
+    },
+    [],
+    { refreshMs: REFRESH_MS }
+  );
 
-          alerts: alerts.map((row) => ({
-            severity: row.severity,
-            title: alertTypeLabel(
-              row.alert_type
-            ),
-            description: row.message,
-            time: clockTime(row.occurred_at),
-          })),
-
-          sightings: recent.map((row) => {
-            const camera = byId.get(
-              row.camera_id
-            );
-
-            return {
-              vehicle:
-                row.plate_text ?? "unreadable",
-              camera: camera
-                ? `${row.camera_id} \u00b7 ${camera.name}`
-                : row.camera_id,
-              zone: camera?.zone ?? "\u2014",
-              time: clockTime(
-                row.first_seen_at
-              ),
-              confidence: percent(
-                row.plate_confidence
-              ),
-            };
-          }),
-        };
-      },
-      [],
-      { refreshMs: REFRESH_MS }
-    );
-
-  // The page renders zeros rather than blanking
-  // while the first load is in flight.
   const data = fetched ?? NOTHING_YET;
-
   const hasData =
     fetched !== null &&
-    (fetched.sightingCount > 0 ||
-      fetched.activeCameras > 0);
+    (fetched.sightingCount > 0 || fetched.activeCameras > 0);
 
   return (
-    <div
-      style={{
-        width: "100%",
-        minHeight: "100vh",
-        background: "#07111f",
-        color: "white",
-        display: "flex",
-        fontFamily:
-          "Inter, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-      }}
+    <AppShell
+      connection={connectionState({
+        loading,
+        error,
+        stream: streamOpen,
+      })}
+      connectionTitle={error ? error.message : lastEvent}
+      actions={<DemoControl />}
     >
-      <Sidebar />
+      <MapWorkspace
+        map={
+          <CityMap
+            showCameras
+            showTraffic
+            showTrajectory={false}
+            onStreamChange={setStreamOpen}
+            onLastEvent={setLastEvent}
+            onError={setMapError}
+          />
+        }
+        panel={
+          <SidePanel width="w-[420px]">
+            <div className="hairline-b px-6 pt-6 pb-5">
+              <h1 className="font-display text-headline-md text-primary">
+                Live Operations
+              </h1>
+              <p className="mt-1 font-body text-body-sm text-on-surface-variant">
+                City-wide vehicle tracking · last 15 minutes
+              </p>
+            </div>
 
-      <main
-        style={{
-          flex: 1,
-          minWidth: 0,
-          padding: "18px",
-        }}
-      >
-        {/* HEADER */}
-
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: "18px",
-            marginBottom: "16px",
-          }}
-        >
-          <div>
-            <div
-              style={{
-                fontSize: "24px",
-                fontWeight: 750,
-                display: "flex",
-                alignItems: "center",
-                gap: "10px",
-              }}
-            >
-              Live Operations Dashboard
-
-              <ConnectionBadge
-                state={connectionState({
-                  loading,
-                  error,
-                })}
-                title={
-                  error
-                    ? error.message
-                    : undefined
-                }
+            {/* Figures, hairline-separated rather than boxed. */}
+            <div className="hairline-b grid grid-cols-2">
+              <PanelFigure
+                value={data.activeCameras.toLocaleString()}
+                label="Cameras"
+                detail={`${data.camerasReporting} reporting`}
+                className="hairline-r hairline-b"
+              />
+              <PanelFigure
+                value={data.sightingCount.toLocaleString()}
+                label="Sightings"
+                detail="Within the window"
+                className="hairline-b"
+              />
+              <PanelFigure
+                value={data.activeAlerts.toLocaleString()}
+                label="Alerts"
+                detail={`${data.highAlerts} high priority`}
+                className="hairline-r"
+                accent={data.highAlerts > 0}
+              />
+              <PanelFigure
+                value={data.worstRatio}
+                label="Worst corridor"
+                detail={data.worstEdge}
               />
             </div>
 
-            <div
-              style={{
-                marginTop: "4px",
-                fontSize: "12px",
-                color: "#7f9dbd",
-              }}
-            >
-              City-wide vehicle tracking, traffic intelligence and alerts
-            </div>
-          </div>
-
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: "9px",
-            }}
-          >
-            <input
-              placeholder="Search vehicle plate..."
-              style={{
-                width: "280px",
-                height: "42px",
-                boxSizing: "border-box",
-                borderRadius: "10px",
-                border:
-                  "1px solid rgba(148,163,184,.16)",
-                background: "#0c1b2d",
-                color: "white",
-                padding: "0 14px",
-                outline: "none",
-                fontSize: "13px",
-              }}
-            />
-
-            <select
-              defaultValue="live"
-              style={{
-                height: "42px",
-                borderRadius: "10px",
-                border:
-                  "1px solid rgba(148,163,184,.16)",
-                background: "#0c1b2d",
-                color: "white",
-                padding: "0 12px",
-                outline: "none",
-                fontSize: "12px",
-                fontWeight: 600,
-              }}
-            >
-              <option value="live">
-                Live · 15 min
-              </option>
-
-              <option value="hour">
-                Last 1 hour
-              </option>
-
-              <option value="today">
-                Today
-              </option>
-
-              <option value="custom">
-                Custom
-              </option>
-            </select>
-          </div>
-        </div>
-
-        <DemoControl />
-
-        {/* KPI CARDS */}
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns:
-              "repeat(4, minmax(0,1fr))",
-            gap: "10px",
-            marginBottom: "12px",
-          }}
-        >
-          <KpiCard
-            label="Active Cameras"
-            value={String(data.activeCameras)}
-            detail={`${data.camerasReporting} reporting`}
-          />
-
-          <KpiCard
-            label="Vehicle Sightings"
-            value={data.sightingCount.toLocaleString()}
-            detail="Within last 15 min"
-          />
-
-          <KpiCard
-            label="Active Alerts"
-            value={String(data.activeAlerts)}
-            detail={`${data.highAlerts} high priority`}
-            accent="#ef4444"
-          />
-
-          <KpiCard
-            label="Worst Corridor"
-            value={data.worstRatio}
-            detail={data.worstEdge}
-            accent="#f97316"
-          />
-        </div>
-
-        {/* MAP + ALERTS */}
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns:
-              "minmax(0, 3.25fr) minmax(250px, 1fr)",
-            gap: "12px",
-            height: "690px",
-          }}
-        >
-          <section
-            style={{
-              position: "relative",
-              minWidth: 0,
-              borderRadius: "16px",
-              overflow: "hidden",
-              border:
-                "1px solid rgba(255,255,255,0.07)",
-              background: "#0f172a",
-              boxShadow:
-                "0 12px 35px rgba(0,0,0,.18)",
-            }}
-          >
-            <CityMap />
-          </section>
-
-          <aside
-            style={{
-              background: "#091828",
-              border:
-                "1px solid rgba(255,255,255,0.07)",
-              borderRadius: "16px",
-              padding: "15px",
-              overflowY: "auto",
-            }}
-          >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                marginBottom: "15px",
-              }}
-            >
-              <div>
-                <div
-                  style={{
-                    fontSize: "15px",
-                    fontWeight: 700,
-                  }}
-                >
-                  Live Alerts
-                </div>
-
-                <div
-                  style={{
-                    marginTop: "3px",
-                    fontSize: "10px",
-                    color: "#64748b",
-                  }}
-                >
-                  Real-time system events
-                </div>
-              </div>
-
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "5px",
-                  padding: "5px 8px",
-                  background:
-                    "rgba(34,197,94,.08)",
-                  borderRadius: "20px",
-                  color: "#4ade80",
-                  fontSize: "10px",
-                  fontWeight: 600,
-                }}
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <Section
+                title="Live alerts"
+                action={<Link to="/alerts">View all</Link>}
               >
-                <span
-                  style={{
-                    width: "6px",
-                    height: "6px",
-                    borderRadius: "50%",
-                    background: "#22c55e",
-                  }}
-                />
-
-                SSE
-              </div>
-            </div>
-
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: "9px",
-              }}
-            >
-              {data.alerts.length === 0 ? (
-                <EmptyState
-                  title={
-                    error
-                      ? "Alerts unavailable"
-                      : "No alerts"
-                  }
-                  detail={
-                    error
-                      ? OFFLINE_HINT
-                      : hasData
-                      ? "Nothing has fired in this window."
-                      : NO_DATA_HINT
-                  }
-                  tone={
-                    error ? "error" : "neutral"
-                  }
-                />
-              ) : (
-                data.alerts.map(
-                (alert, index) => (
-                  <AlertCard
-                    key={index}
-                    severity={alert.severity}
-                    title={alert.title}
-                    description={
-                      alert.description
+                {data.alerts.length === 0 ? (
+                  <EmptyState
+                    title={error ? "Alerts unavailable" : "No alerts"}
+                    detail={
+                      error
+                        ? OFFLINE_HINT
+                        : hasData
+                          ? "Nothing has fired in this window."
+                          : NO_DATA_HINT
                     }
-                    time={alert.time}
+                    tone={error ? "error" : "neutral"}
                   />
-                )
-              ))}
-            </div>
-          </aside>
-        </div>
+                ) : (
+                  data.alerts.map((alert, index) => (
+                    <div
+                      key={index}
+                      className="flex gap-3 border-l-2 py-3 pl-3"
+                      style={{
+                        borderColor: severity(alert.severity).hex,
+                      }}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-baseline justify-between gap-3">
+                          <span className="font-body text-[13px] font-semibold text-on-surface">
+                            {alert.title}
+                          </span>
+                          <span className="shrink-0 font-body text-[11px] text-on-surface-variant">
+                            {alert.time}
+                          </span>
+                        </div>
+                        <p className="mt-1 font-body text-[12px] leading-relaxed text-on-surface-variant">
+                          {alert.description}
+                        </p>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </Section>
 
-        {/* RECENT SIGHTINGS */}
-
-        <section
-          style={{
-            marginTop: "12px",
-            background: "#091828",
-            border:
-              "1px solid rgba(255,255,255,0.07)",
-            borderRadius: "16px",
-            padding: "15px",
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              marginBottom: "12px",
-            }}
-          >
-            <div>
-              <div
-                style={{
-                  fontSize: "15px",
-                  fontWeight: 700,
-                }}
+              <Section
+                title="Recent sightings"
+                action={<Link to="/vehicles">Trace</Link>}
               >
-                Recent Vehicle Sightings
-              </div>
-
-              <div
-                style={{
-                  marginTop: "3px",
-                  color: "#64748b",
-                  fontSize: "10px",
-                }}
-              >
-                Latest ANPR observations
-              </div>
+                {data.sightings.length === 0 ? (
+                  <EmptyState
+                    title={
+                      error ? "Sightings unavailable" : "No sightings yet"
+                    }
+                    detail={error ? OFFLINE_HINT : NO_DATA_HINT}
+                    tone={error ? "error" : "neutral"}
+                  />
+                ) : (
+                  data.sightings.map((sighting, index) => (
+                    <div key={index}>
+                      {index > 0 && <Rule />}
+                      <div className="flex items-baseline justify-between gap-3 py-3">
+                        <div className="min-w-0">
+                          <div className="font-body text-data text-on-surface">
+                            {sighting.vehicle}
+                          </div>
+                          <div className="mt-0.5 truncate font-body text-[11px] text-on-surface-variant">
+                            {sighting.camera}
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-right">
+                          <div className="font-body text-[11px] text-on-surface-variant">
+                            {sighting.time}
+                          </div>
+                          <Chip className="mt-1 bg-secondary-container text-on-secondary-container">
+                            {sighting.confidence}
+                          </Chip>
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </Section>
             </div>
 
-            <Link
-              to="/vehicles"
-              style={{
-                color: "#38bdf8",
-                fontSize: "11px",
-                textDecoration: "none",
-                fontWeight: 600,
-              }}
-            >
-              View all →
-            </Link>
-          </div>
-
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns:
-                "1.1fr 1.3fr 1fr 1fr .7fr",
-              gap: "10px",
-              padding: "8px 6px",
-              fontSize: "10px",
-              color: "#64748b",
-              textTransform: "uppercase",
-              letterSpacing: ".5px",
-            }}
-          >
-            <div>Vehicle</div>
-            <div>Camera</div>
-            <div>Zone</div>
-            <div>Time</div>
-            <div>Confidence</div>
-          </div>
-
-          {data.sightings.length === 0 ? (
-            <EmptyState
-              title={
-                error
-                  ? "Sightings unavailable"
-                  : "No sightings yet"
-              }
-              detail={
-                error ? OFFLINE_HINT : NO_DATA_HINT
-              }
-              tone={error ? "error" : "neutral"}
-            />
-          ) : (
-            data.sightings.map(
-            (sighting, index) => (
-              <SightingRow
-                key={index}
-                vehicle={sighting.vehicle}
-                camera={sighting.camera}
-                zone={sighting.zone}
-                time={sighting.time}
-                confidence={
-                  sighting.confidence
-                }
+            <div className="hairline-t flex items-center gap-2 px-6 py-3">
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  streamOpen ? "bg-primary" : "bg-outline-variant"
+                }`}
               />
-            )
-          ))}
-        </section>
-      </main>
-    </div>
+              <span className="truncate font-body text-[11px] text-on-surface-variant">
+                {streamOpen ? lastEvent : "Live stream offline"}
+              </span>
+            </div>
+          </SidePanel>
+        }
+        overlays={
+          mapError ? (
+            <FloatingCard className="absolute right-6 bottom-6 z-20 max-w-xs">
+              <Label className="text-error">Map data unavailable</Label>
+              <p className="mt-2 font-body text-[12px] text-on-surface-variant">
+                {mapError}
+              </p>
+            </FloatingCard>
+          ) : (
+            <FloatingCard className="absolute right-6 bottom-6 z-20">
+              <Label>Congestion</Label>
+              <div className="mt-2 h-1.5 w-40 rounded-full bg-gradient-to-r from-[#6b7b3a] via-[#b4690e] to-[#ba1a1a]" />
+              <div className="mt-1.5 flex justify-between font-body text-[10px] text-on-surface-variant">
+                <span>Free flow</span>
+                <span>Severe</span>
+              </div>
+            </FloatingCard>
+          )
+        }
+      />
+    </AppShell>
   );
 }
 
-// =====================================
-// KPI
-// =====================================
-
-function KpiCard({
-  label,
+function PanelFigure({
   value,
+  label,
   detail,
-  accent = "#60a5fa",
+  className = "",
+  accent = false,
 }: {
-  label: string;
   value: string;
+  label: string;
   detail: string;
-  accent?: string;
+  className?: string;
+  accent?: boolean;
 }) {
   return (
-    <div
-      style={{
-        background: "#091828",
-        border:
-          "1px solid rgba(255,255,255,0.07)",
-        borderRadius: "13px",
-        padding: "14px 16px",
-        minHeight: "92px",
-      }}
-    >
+    <div className={`px-6 py-5 ${className}`}>
       <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-        }}
-      >
-        <div
-          style={{
-            fontSize: "11px",
-            color: "#8ba7c5",
-          }}
-        >
-          {label}
-        </div>
-
-        <span
-          style={{
-            width: "6px",
-            height: "6px",
-            borderRadius: "50%",
-            background: accent,
-          }}
-        />
-      </div>
-
-      <div
-        style={{
-          marginTop: "7px",
-          fontSize: "23px",
-          fontWeight: 750,
-        }}
+        className={`font-display text-headline-md ${
+          accent ? "text-error" : "text-on-surface"
+        }`}
       >
         {value}
       </div>
-
-      <div
-        style={{
-          marginTop: "3px",
-          fontSize: "10px",
-          color: "#64748b",
-        }}
-      >
+      <Label className="mt-1 block">{label}</Label>
+      <div className="mt-1 truncate font-body text-[11px] text-on-surface-variant/80">
         {detail}
       </div>
     </div>
   );
 }
 
-// =====================================
-// ALERT
-// =====================================
-
-function AlertCard({
-  severity,
+function Section({
   title,
-  description,
-  time,
+  action,
+  children,
 }: {
-  severity:
-    | "low"
-    | "medium"
-    | "high";
-
   title: string;
-  description: string;
-  time: string;
+  action?: React.ReactNode;
+  children: React.ReactNode;
 }) {
-  const color =
-    severity === "high"
-      ? "#ef4444"
-      : severity === "medium"
-      ? "#f59e0b"
-      : "#38bdf8";
-
   return (
-    <div
-      style={{
-        borderLeft: `3px solid ${color}`,
-        background: "#0c1b2d",
-        padding: "12px",
-        borderRadius: "9px",
-        cursor: "pointer",
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          gap: "8px",
-        }}
-      >
-        <div
-          style={{
-            fontSize: "12px",
-            fontWeight: 650,
-          }}
-        >
+    <section className="hairline-b px-6 py-5">
+      <div className="mb-2 flex items-baseline justify-between">
+        <h2 className="font-display text-headline-sm text-on-surface">
           {title}
-        </div>
-
-        <span
-          style={{
-            fontSize: "9px",
-            color,
-            textTransform: "uppercase",
-            fontWeight: 700,
-          }}
-        >
-          {severity}
+        </h2>
+        <span className="font-body text-label-caps uppercase text-primary [&_a]:transition-colors hover:[&_a]:text-primary-container">
+          {action}
+          <Icon name="arrow_forward" size={12} className="ml-1 align-middle" />
         </span>
       </div>
-
-      <div
-        style={{
-          marginTop: "6px",
-          fontSize: "11px",
-          color: "#8ba7c5",
-          lineHeight: 1.45,
-        }}
-      >
-        {description}
-      </div>
-
-      <div
-        style={{
-          marginTop: "7px",
-          fontSize: "9px",
-          color: "#64748b",
-        }}
-      >
-        {time}
-      </div>
-    </div>
-  );
-}
-
-// =====================================
-// SIGHTING
-// =====================================
-
-function SightingRow({
-  vehicle,
-  camera,
-  zone,
-  time,
-  confidence,
-}: {
-  vehicle: string;
-  camera: string;
-  zone: string;
-  time: string;
-  confidence: string;
-}) {
-  return (
-    <div
-      style={{
-        display: "grid",
-        gridTemplateColumns:
-          "1.1fr 1.3fr 1fr 1fr .7fr",
-        gap: "10px",
-        padding: "11px 6px",
-        borderTop:
-          "1px solid rgba(255,255,255,0.05)",
-        fontSize: "11px",
-        color: "#a9bdd1",
-        alignItems: "center",
-      }}
-    >
-      <div
-        style={{
-          fontWeight: 650,
-          color: "#f8fafc",
-        }}
-      >
-        {vehicle}
-      </div>
-
-      <div>{camera}</div>
-      <div>{zone}</div>
-      <div>{time}</div>
-
-      <div
-        style={{
-          color: "#4ade80",
-          fontWeight: 650,
-        }}
-      >
-        {confidence}
-      </div>
-    </div>
+      {children}
+    </section>
   );
 }

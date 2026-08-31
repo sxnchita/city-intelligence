@@ -110,11 +110,54 @@ export function getAlertStats(
   );
 }
 
+// =====================================
+// ALERT DETAIL
+// GET /api/alerts/{id}
+//
+// Full context: the sighting that
+// triggered it, the vehicle, and — for
+// a clone alert — both vehicles side by
+// side. That second vehicle is what
+// makes the cloned-plate card possible.
+// =====================================
+
+export type AlertObservation = {
+  observation_id: number;
+  camera_id: string | null;
+  first_seen_at: string;
+  dwell_ms: number | null;
+  plate_text: string | null;
+  plate_confidence: number | null;
+  vehicle_type: string | null;
+  vehicle_colour: string | null;
+  snapshot_url: string | null;
+};
+
+export type AlertVehicle = {
+  vehicle_id: number;
+  canonical_plate: string | null;
+  status: string;
+  sighting_count: number;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  last_camera_id: string | null;
+  vehicle_type: string | null;
+  vehicle_colour: string | null;
+};
+
+export type AlertDetail = {
+  alert: AlertSummary;
+  observation: AlertObservation | null;
+  vehicle: AlertVehicle | null;
+  /** Present on clone alerts: the other vehicle wearing the plate. */
+  related_vehicle: AlertVehicle | null;
+};
+
 export function getAlert(
   alertId: number,
   signal?: AbortSignal
-): Promise<unknown> {
-  return getJson<unknown>(
+): Promise<AlertDetail> {
+  return getJson<AlertDetail>(
     `/api/alerts/${alertId}`,
     undefined,
     signal
