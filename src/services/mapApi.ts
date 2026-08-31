@@ -1,6 +1,4 @@
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL ||
-  "http://localhost:8000";
+import { getJson } from "./http";
 
 // =====================================
 // GEOJSON TYPES
@@ -23,7 +21,13 @@ export type GeoJSONFeature<
   TProperties
 > = {
   type: "Feature";
-  geometry: TGeometry;
+
+  // Null when a record has no coordinates —
+  // camera/GeoJsonFeatureCollection.java emits
+  // a feature with null geometry rather than
+  // dropping the row.
+  geometry: TGeometry | null;
+
   properties: TProperties;
 };
 
@@ -36,14 +40,17 @@ export type GeoJSONFeatureCollection<
 
 // =====================================
 // CAMERA TYPES
+// GET /api/cameras
 // =====================================
 
 export type CameraProperties = {
   camera_id: string;
   name: string;
-  heading: number;
+  heading_degrees: number;
   zone: string;
-  last_seen_at: string;
+  is_provisional: boolean;
+  is_active: boolean;
+  last_event_at: string | null;
 };
 
 export type CameraFeature =
@@ -52,48 +59,92 @@ export type CameraFeature =
     CameraProperties
   >;
 
+/**
+ * The camera response carries the map's own
+ * framing, which is what makes the frontend
+ * city-agnostic: never hardcode a centre.
+ *
+ * bbox and center are [] and suggested_zoom is
+ * 2 when no camera has coordinates.
+ */
 export type CameraCollection =
-  GeoJSONFeatureCollection<CameraFeature>;
+  GeoJSONFeatureCollection<CameraFeature> & {
+    camera_set: string;
+    bbox: number[];
+    center: number[];
+    suggested_zoom: number;
+  };
 
 // =====================================
 // TRAJECTORY TYPES
+// GET /api/vehicles/{id}/trajectory
 // =====================================
 
-export type TrajectoryPointProperties = {
-  feature_type: "sighting";
+export type TrajectorySightingProperties = {
+  kind: "sighting";
+
+  sequence: number;
+  observation_id: number;
 
   camera_id: string;
-  timestamp: string;
+  camera_name: string | null;
+  zone: string | null;
 
-  confidence?: number;
-  sequence?: number;
+  timestamp: string;
+  dwell_ms: number | null;
+
+  plate_read: string | null;
+  plate_confidence: number | null;
+
+  vehicle_type: string | null;
+  vehicle_colour: string | null;
+  snapshot_url: string | null;
 };
 
-export type TrajectoryLineProperties = {
-  feature_type: "hop";
+export type TrajectoryHopProperties = {
+  kind: "hop";
 
-  from_camera_id?: string;
-  to_camera_id?: string;
+  sequence: number;
 
-  link_confidence: number;
+  from_camera_id: string | null;
+  to_camera_id: string;
+
+  link_confidence: number | null;
+  score_breakdown: unknown;
+
+  duration_s: number | null;
+  typical_s: number | null;
+  distance_m: number | null;
+
+  /**
+   * Always true: the road between two cameras is
+   * never observed, only its endpoints.
+   */
+  inferred: boolean;
+
+  /**
+   * "road" when the backend has real road
+   * geometry for this edge, "straight_line" when
+   * it is drawing the honest fallback.
+   */
+  geometry_source: "road" | "straight_line";
 
   skipped_cameras: string[];
 
-  detour_suspected: boolean;
-
-  sequence?: number;
+  /** Null when typical_s is unknown. */
+  detour_suspected: boolean | null;
 };
 
 export type TrajectoryPointFeature =
   GeoJSONFeature<
     GeoJSONPointGeometry,
-    TrajectoryPointProperties
+    TrajectorySightingProperties
   >;
 
 export type TrajectoryLineFeature =
   GeoJSONFeature<
     GeoJSONLineStringGeometry,
-    TrajectoryLineProperties
+    TrajectoryHopProperties
   >;
 
 export type TrajectoryFeature =
@@ -103,25 +154,58 @@ export type TrajectoryFeature =
 export type TrajectoryCollection =
   GeoJSONFeatureCollection<TrajectoryFeature>;
 
+/**
+ * Summary fields sit flat at the root, with the
+ * features nested under `geojson` — the response
+ * is not itself a FeatureCollection.
+ */
+export type TrajectoryResponse = {
+  vehicle_id: number;
+  canonical_plate: string | null;
+  status: string;
+
+  sighting_count: number;
+
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+
+  min_link_confidence: number | null;
+  mean_link_confidence: number | null;
+
+  total_distance_m: number | null;
+  total_duration_s: number | null;
+
+  geojson: TrajectoryCollection;
+};
+
 // =====================================
 // TRAFFIC / HEATMAP TYPES
+// GET /api/analytics/heatmap
 // =====================================
 
+/** Null when the sample was too thin to band. */
 export type CongestionBand =
-  | "normal"
+  | "free"
   | "moderate"
   | "heavy"
   | "severe";
 
 export type TrafficProperties = {
-  road_id?: string;
-  road_name?: string;
+  edge_id: number;
+
+  from_camera_id: string;
+  to_camera_id: string;
 
   weight: number;
 
+  /** 0–1 against the busiest edge in this response. */
   normalized: number;
 
-  congestion_band: CongestionBand;
+  median_duration_s: number | null;
+  free_flow_s: number | null;
+
+  congestion_ratio: number | null;
+  congestion_band: CongestionBand | null;
 
   sample_count: number;
 };
@@ -133,92 +217,51 @@ export type TrafficFeature =
   >;
 
 export type TrafficCollection =
-  GeoJSONFeatureCollection<TrafficFeature>;
+  GeoJSONFeatureCollection<TrafficFeature> & {
+    as_of: string;
+    from: string;
+    to: string;
+    bucket_minutes: number;
+    max_weight: number;
+    edge_count: number;
+  };
 
 // =====================================
-// CAMERAS
-// GET /api/v1/cameras
+// CALLS
 // =====================================
 
-export async function getCameras(): Promise<CameraCollection> {
-  const response = await fetch(
-    `${API_BASE_URL}/api/v1/cameras`
+export function getCameras(
+  signal?: AbortSignal
+): Promise<CameraCollection> {
+  return getJson<CameraCollection>(
+    "/api/cameras",
+    undefined,
+    signal
   );
-
-  if (!response.ok) {
-    throw new Error(
-      `Failed to fetch cameras: ${response.status}`
-    );
-  }
-
-  return response.json();
 }
 
-// =====================================
-// VEHICLE TRAJECTORY
-// GET /api/v1/vehicles/{id}/trajectory
-// =====================================
-
-export async function getVehicleTrajectory(
-  vehicleId: string,
+/** Vehicle ids are numeric — a non-numeric id is a 400. */
+export function getVehicleTrajectory(
+  vehicleId: number,
   from?: string,
-  to?: string
-): Promise<TrajectoryCollection> {
-  const params =
-    new URLSearchParams();
-
-  if (from) {
-    params.set("from", from);
-  }
-
-  if (to) {
-    params.set("to", to);
-  }
-
-  const query =
-    params.toString()
-      ? `?${params.toString()}`
-      : "";
-
-  const response = await fetch(
-    `${API_BASE_URL}/api/v1/vehicles/${encodeURIComponent(
-      vehicleId
-    )}/trajectory${query}`
+  to?: string,
+  signal?: AbortSignal
+): Promise<TrajectoryResponse> {
+  return getJson<TrajectoryResponse>(
+    `/api/vehicles/${vehicleId}/trajectory`,
+    { from, to },
+    signal
   );
-
-  if (!response.ok) {
-    throw new Error(
-      `Failed to fetch trajectory: ${response.status}`
-    );
-  }
-
-  return response.json();
 }
 
-// =====================================
-// TRAFFIC HEATMAP
-// GET /api/v1/analytics/heatmap
-// =====================================
-
-export async function getTrafficHeatmap(
-  from: string,
-  to: string
+export function getTrafficHeatmap(
+  from?: string,
+  to?: string,
+  signal?: AbortSignal
 ): Promise<TrafficCollection> {
-  const params =
-    new URLSearchParams();
-
-  params.set("from", from);
-  params.set("to", to);
-
-  const response = await fetch(
-    `${API_BASE_URL}/api/v1/analytics/heatmap?${params.toString()}`
+  return getJson<TrafficCollection>(
+    "/api/analytics/heatmap",
+    { from, to },
+    signal
   );
-
-  if (!response.ok) {
-    throw new Error(
-      `Failed to fetch traffic heatmap: ${response.status}`
-    );
-  }
-
-  return response.json();
 }

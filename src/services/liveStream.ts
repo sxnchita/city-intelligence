@@ -1,122 +1,144 @@
-const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL ||
-  "http://localhost:8000";
+import { API_BASE } from "./http";
+import type { AlertType, Severity } from "./alertsApi";
 
 // =====================================
 // LIVE EVENT TYPES
+// GET /api/stream  (Server-Sent Events)
+//
+// The backend sends NAMED events via
+// SseEmitter.event().name(...), so these
+// arrive through addEventListener and
+// never through onmessage.
 // =====================================
 
-export type LiveSightingEvent = {
-  event: "new_sighting";
-
-  data: {
-    vehicle_id: string;
-    camera_id: string;
-
-    timestamp: string;
-
-    latitude: number;
-    longitude: number;
-
-    confidence?: number;
-  };
+export type SightingEventData = {
+  camera_id: string;
+  vehicle_id: number;
+  plate: string | null;
+  timestamp: string;
+  is_new_vehicle: boolean;
+  link_confidence: number | null;
 };
 
-export type LiveAlertEvent = {
-  event: "new_alert";
+/**
+ * Narrower than the AlertSummary rows served by
+ * GET /api/alerts — no zone, plate, created_at,
+ * observation_id or repeat_count.
+ */
+export type AlertEventData = {
+  alert_id: number;
+  alert_type: AlertType;
+  severity: Severity;
 
-  data: {
-    alert_id: string;
+  vehicle_id: number | null;
+  related_vehicle_id: number | null;
 
-    type: string;
+  camera_id: string | null;
+  camera_name: string | null;
 
-    severity:
-      | "low"
-      | "medium"
-      | "high"
-      | "critical";
+  lat: number | null;
+  lon: number | null;
 
-    message: string;
-
-    timestamp: string;
-
-    vehicle_id?: string;
-
-    camera_id?: string;
-  };
+  occurred_at: string;
+  message: string;
+  metadata: Record<string, unknown> | null;
 };
 
 export type LiveEvent =
-  | LiveSightingEvent
-  | LiveAlertEvent;
+  | { event: "sighting"; data: SightingEventData }
+  | { event: "alert"; data: AlertEventData };
+
+export type StreamStatus =
+  | "connecting"
+  | "connected"
+  | "disconnected";
+
+export type LiveStreamHandlers = {
+  onSighting?: (
+    data: SightingEventData
+  ) => void;
+
+  onAlert?: (data: AlertEventData) => void;
+
+  /** Fires for either kind, after the specific handler. */
+  onAny?: (event: LiveEvent) => void;
+
+  onOpen?: () => void;
+  onError?: (error: Event) => void;
+};
 
 // =====================================
-// SSE CONNECTION
-// GET /api/v1/stream
+// CONNECT
 // =====================================
 
 export function connectLiveStream(
-  onEvent: (event: LiveEvent) => void,
+  handlers: LiveStreamHandlers
+): EventSource {
+  const source = new EventSource(
+    `${API_BASE}/api/stream`
+  );
 
-  onOpen?: () => void,
-
-  onError?: (error: Event) => void
-) {
-  const eventSource =
-    new EventSource(
-      `${API_BASE_URL}/api/v1/stream`
-    );
-
-  // =====================================
-  // CONNECTION OPENED
-  // =====================================
-
-  eventSource.onopen = () => {
-    console.log(
-      "SSE stream connected"
-    );
-
-    onOpen?.();
+  source.onopen = () => {
+    handlers.onOpen?.();
   };
 
-  // =====================================
-  // GENERIC MESSAGE
-  // =====================================
+  source.onerror = (error) => {
+    // EventSource reconnects on its own; the
+    // backend also refuses connections past
+    // stream.max-emitters (50) with a 503.
+    handlers.onError?.(error);
+  };
 
-  eventSource.onmessage = (
-    message
-  ) => {
-    try {
-      const parsed =
-        JSON.parse(
-          message.data
-        ) as LiveEvent;
+  source.addEventListener(
+    "sighting",
+    (message) => {
+      const data =
+        parse<SightingEventData>(message);
 
-      onEvent(parsed);
-    } catch (error) {
-      console.error(
-        "Invalid SSE message:",
-        error
-      );
+      if (!data) {
+        return;
+      }
+
+      handlers.onSighting?.(data);
+      handlers.onAny?.({
+        event: "sighting",
+        data,
+      });
     }
-  };
+  );
 
-  // =====================================
-  // ERROR / DISCONNECT
-  // =====================================
+  source.addEventListener(
+    "alert",
+    (message) => {
+      const data =
+        parse<AlertEventData>(message);
 
-  eventSource.onerror = (
-    error
-  ) => {
+      if (!data) {
+        return;
+      }
+
+      handlers.onAlert?.(data);
+      handlers.onAny?.({
+        event: "alert",
+        data,
+      });
+    }
+  );
+
+  return source;
+}
+
+function parse<T>(
+  message: MessageEvent
+): T | null {
+  try {
+    return JSON.parse(message.data) as T;
+  } catch (error) {
     console.error(
-      "SSE connection error:",
+      "Invalid SSE payload:",
       error
     );
 
-    onError?.(
-      error
-    );
-  };
-
-  return eventSource;
+    return null;
+  }
 }

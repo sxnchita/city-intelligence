@@ -2,8 +2,9 @@ import { useEffect, useRef, useState } from "react";
 import L, {
   GeoJSON,
   Map as LeafletMap,
-  PathOptions,
 } from "leaflet";
+
+import type { PathOptions } from "leaflet";
 
 import "leaflet/dist/leaflet.css";
 
@@ -21,36 +22,50 @@ import {
   type TrajectoryPointFeature,
 } from "../../services/mapApi";
 
-import {
-  connectLiveStream,
-  type LiveEvent,
-} from "../../services/liveStream";
+import { connectLiveStream } from "../../services/liveStream";
 
-import { getRoadRoute } from "../../services/routingService";
-
-import {
-  mockCameraGeoJson,
-  mockTrajectoryGeoJson,
-  mockTrafficGeoJson,
-  DEMO_VEHICLE_ROUTES,
-} from "../../data/mockBackendGeoJson";
-
-import { CAMERA_BY_ID } from "../../data/cameras";
-
-const DEFAULT_VEHICLE_ID = "V123";
 const TRAFFIC_REFRESH_MS = 30_000;
-const MIN_TRAFFIC_SAMPLE_COUNT = 10;
+
+// How long a live sighting pulse stays on the map.
+// Long enough to notice at a glance, short enough
+// that a busy corridor does not turn into a solid
+// blob of markers.
+const SIGHTING_PULSE_MS = 6_000;
+
+// Alert pins outlive sighting pulses: an alert is
+// the thing a viewer is meant to walk over and
+// look at.
+const ALERT_PIN_MS = 60_000;
 
 type CityMapProps = {
   showCamerasInitially?: boolean;
   showTrajectoryInitially?: boolean;
   showTrafficInitially?: boolean;
+
+  /**
+   * Which vehicle's journey to draw. Vehicle ids
+   * are numeric on the backend. Omitted means the
+   * trajectory layer is simply not drawn -- there
+   * is no honest journey to show without one.
+   */
+  vehicleId?: number;
+
+  /**
+   * Window for the traffic heatmap, as ISO
+   * instants. Omitting both is the live path: the
+   * backend defaults to the last 15 minutes.
+   */
+  from?: string;
+  to?: string;
 };
 
 export default function CityMap({
   showCamerasInitially = true,
   showTrajectoryInitially = true,
   showTrafficInitially = true,
+  vehicleId,
+  from,
+  to,
 }: CityMapProps) {
   const mapContainerRef =
     useRef<HTMLDivElement | null>(null);
@@ -89,22 +104,55 @@ export default function CityMap({
     | "disconnected"
   >("connecting");
 
-  const [dataMode, setDataMode] =
-    useState<
-      "backend" | "demo"
-    >("demo");
+  // The last error from any of the three loaders.
+  // There is no bundled fallback: if the backend
+  // is not answering the map says so rather than
+  // drawing another city's geometry.
+  const [loadError, setLoadError] =
+    useState<string | null>(null);
 
   const [lastEvent, setLastEvent] =
     useState(
       "Waiting for live stream"
     );
 
-  // Live vehicle simulation state
-  const [liveLabel, setLiveLabel] =
+  // Which camera set the backend is serving —
+  // shown so the map never has to name a city.
+  const [cameraSet, setCameraSet] =
     useState("");
 
-  const liveMarkerRef =
-    useRef<L.Marker | null>(null);
+  const [cameraCount, setCameraCount] =
+    useState(0);
+
+  // Where each camera is, keyed by camera_id, so a
+  // streamed sighting can be pinned without a
+  // second call. Filled by loadCameras.
+  const cameraPositionsRef = useRef<
+    Map<string, [number, number]>
+  >(new Map());
+
+  // Transient live markers, so cleanup can remove
+  // whatever is still on screen at unmount.
+  const liveMarkersRef = useRef<Set<L.Layer>>(
+    new Set()
+  );
+
+  // The init effect runs once, but the page can
+  // change its range afterwards. Refs let the
+  // polling loop read the current window without
+  // tearing the whole map down and rebuilding it.
+  const fromRef = useRef(from);
+  fromRef.current = from;
+
+  const toRef = useRef(to);
+  toRef.current = to;
+
+  // Filled by the init effect. Lets a range change
+  // redraw the heatmap without tearing down the
+  // Leaflet map and losing the viewer's pan/zoom.
+  const reloadTrafficRef = useRef<
+    (() => void) | null
+  >(null);
 
   // =====================================
   // INITIALIZE MAP
@@ -126,6 +174,10 @@ export default function CityMap({
 
     let disposed = false;
 
+    // Captured once so the cleanup below is not
+    // reading a ref that may have moved on.
+    const liveMarkers = liveMarkersRef.current;
+
     const map = L.map(
       container,
       {
@@ -133,8 +185,10 @@ export default function CityMap({
         attributionControl: true,
       }
     ).setView(
-      [28.63, 77.215],
-      12
+      // Replaced by frameMap() from the camera
+      // response — never hardcode a city.
+      [20.59, 78.96],
+      5
     );
 
     mapRef.current = map;
@@ -169,25 +223,36 @@ export default function CityMap({
 
       cameraLayerRef.current?.remove();
 
+      // Cameras with no coordinates come back as
+      // features with null geometry; Leaflet has
+      // nothing to place for those.
+      const placeable = {
+        type: "FeatureCollection" as const,
+        features: collection.features.filter(
+          (feature) => feature.geometry !== null
+        ),
+      };
+
       const layer = L.geoJSON(
-        collection,
+        placeable as never,
         {
           pointToLayer: (
             feature,
             latlng
           ) => {
             const camera =
-              feature as CameraFeature;
+              feature as unknown as CameraFeature;
 
             const color =
               getCameraHealthColor(
                 camera.properties
-                  .last_seen_at
+                  .last_event_at,
+                camera.properties.is_active
               );
 
             const heading =
               camera.properties
-                .heading;
+                .heading_degrees;
 
             const icon =
               L.divIcon({
@@ -237,12 +302,13 @@ export default function CityMap({
             layer
           ) => {
             const camera =
-              feature as CameraFeature;
+              feature as unknown as CameraFeature;
 
             const health =
               getCameraHealthLabel(
                 camera.properties
-                  .last_seen_at
+                  .last_event_at,
+                camera.properties.is_active
               );
 
             layer.bindPopup(`
@@ -270,7 +336,7 @@ export default function CityMap({
                 <br />
 
                 Heading:
-                ${camera.properties.heading}°
+                ${camera.properties.heading_degrees}°
 
                 <br />
 
@@ -284,7 +350,7 @@ export default function CityMap({
                 Last seen:
                 ${formatDateTime(
                   camera.properties
-                    .last_seen_at
+                    .last_event_at
                 )}
               </div>
             `);
@@ -326,11 +392,10 @@ export default function CityMap({
             feature
           ): PathOptions => {
             const item =
-              feature as TrajectoryFeature;
+              feature as unknown as TrajectoryFeature;
 
             if (
-              item.geometry.type !==
-              "LineString"
+              item.properties.kind !== "hop"
             ) {
               return {};
             }
@@ -341,12 +406,9 @@ export default function CityMap({
           },
 
           pointToLayer: (
-            feature,
+            _feature,
             latlng
           ) => {
-            const point =
-              feature as TrajectoryPointFeature;
-
             return L.circleMarker(
               latlng,
               {
@@ -365,11 +427,11 @@ export default function CityMap({
             layer
           ) => {
             const item =
-              feature as TrajectoryFeature;
+              feature as unknown as TrajectoryFeature;
 
             if (
-              item.geometry.type ===
-              "Point"
+              item.properties.kind ===
+              "sighting"
             ) {
               const point =
                 item as TrajectoryPointFeature;
@@ -389,7 +451,20 @@ export default function CityMap({
                   <br />
 
                   Camera:
-                  ${point.properties.camera_id}
+                  ${
+                    point.properties
+                      .camera_name ??
+                    point.properties.camera_id
+                  }
+
+                  <br />
+
+                  Plate read:
+                  ${
+                    point.properties
+                      .plate_read ??
+                    "unreadable"
+                  }
 
                   <br />
 
@@ -400,16 +475,16 @@ export default function CityMap({
 
                   ${
                     point.properties
-                      .confidence !==
-                    undefined
+                      .plate_confidence !==
+                    null
                       ? `
                         <br />
 
-                        Confidence:
+                        Plate confidence:
                         ${Math.round(
-                          point.properties
-                            .confidence *
-                            100
+                          (point.properties
+                            .plate_confidence ??
+                            0) * 100
                         )}%
                       `
                       : ""
@@ -435,11 +510,55 @@ export default function CityMap({
                   <br />
 
                   Link confidence:
-                  ${Math.round(
+                  ${
                     line.properties
-                      .link_confidence *
-                      100
-                  )}%
+                      .link_confidence !== null
+                      ? `${Math.round(
+                          (line.properties
+                            .link_confidence ??
+                            0) * 100
+                        )}%`
+                      : "unknown"
+                  }
+
+                  <br />
+
+                  Travel time:
+                  ${formatSeconds(
+                    line.properties.duration_s
+                  )}
+                  ${
+                    line.properties.typical_s !==
+                    null
+                      ? ` (typical ${formatSeconds(
+                          line.properties.typical_s
+                        )})`
+                      : ""
+                  }
+
+                  <br />
+
+                  Distance:
+                  ${
+                    line.properties.distance_m !==
+                    null
+                      ? `${(
+                          (line.properties
+                            .distance_m ?? 0) /
+                          1000
+                        ).toFixed(2)} km`
+                      : "unknown"
+                  }
+
+                  <br />
+
+                  Path:
+                  ${
+                    line.properties
+                      .geometry_source === "road"
+                      ? "road geometry"
+                      : "straight line (no road data)"
+                  }
 
                   <br />
 
@@ -459,7 +578,10 @@ export default function CityMap({
                   Detour suspected:
                   ${
                     line.properties
-                      .detour_suspected
+                      .detour_suspected === null
+                      ? "Unknown"
+                      : line.properties
+                          .detour_suspected
                       ? "Yes"
                       : "No"
                   }
@@ -526,8 +648,12 @@ export default function CityMap({
                 <strong>
                   ${
                     traffic.properties
-                      .road_name ||
-                    "Road segment"
+                      .from_camera_id
+                  }
+                  &rarr;
+                  ${
+                    traffic.properties
+                      .to_camera_id
                   }
                 </strong>
 
@@ -536,7 +662,16 @@ export default function CityMap({
                 Congestion:
                 ${
                   traffic.properties
-                    .congestion_band
+                    .congestion_band ??
+                  "too few samples"
+                }
+                ${
+                  traffic.properties
+                    .congestion_ratio !== null
+                    ? ` (${traffic.properties.congestion_ratio.toFixed(
+                        2
+                      )}&times; free flow)`
+                    : ""
                 }
 
                 <br />
@@ -577,6 +712,45 @@ export default function CityMap({
 
     // =====================================
     // LOAD CAMERAS
+    //
+    // The response carries the map's own
+    // framing, so the view follows whichever
+    // city the backend is configured for.
+    // =====================================
+
+    function frameMap(
+      collection: CameraCollection
+    ) {
+      const { bbox, center, suggested_zoom } =
+        collection;
+
+      if (bbox.length === 4) {
+        map.fitBounds(
+          [
+            [bbox[1], bbox[0]],
+            [bbox[3], bbox[2]],
+          ],
+          { padding: [40, 40] }
+        );
+
+        return;
+      }
+
+      if (center.length === 2) {
+        map.setView(
+          [center[1], center[0]],
+          suggested_zoom
+        );
+      }
+    }
+
+    // =====================================
+    // LOAD CAMERAS
+    //
+    // The camera response carries the map's
+    // own framing, so this is also what
+    // decides which city the map opens on.
+    // Nothing here is hardcoded.
     // =====================================
 
     async function loadCameras() {
@@ -588,160 +762,151 @@ export default function CityMap({
           return;
         }
 
-        renderCameraLayer(
-          cameras
-        );
+        renderCameraLayer(cameras);
+        frameMap(cameras);
 
-        setDataMode(
-          "backend"
+        // Keep every camera's position so a
+        // streamed sighting, which carries only a
+        // camera_id, can be pinned without a
+        // follow-up call.
+        const positions = new Map<
+          string,
+          [number, number]
+        >();
+
+        for (const feature of cameras.features) {
+          if (feature.geometry === null) {
+            continue;
+          }
+
+          const [lon, lat] =
+            feature.geometry.coordinates;
+
+          positions.set(
+            feature.properties.camera_id,
+            [lat, lon]
+          );
+        }
+
+        cameraPositionsRef.current = positions;
+
+        setCameraSet(cameras.camera_set);
+        setCameraCount(
+          cameras.features.length
         );
-      } catch {
+        setLoadError(null);
+      } catch (error) {
         if (disposed) {
           return;
         }
 
-        renderCameraLayer(
-          mockCameraGeoJson
-        );
-
-        setDataMode(
-          "demo"
+        // No fallback collection. Drawing another
+        // city's cameras here would be a lie that
+        // survives all the way to a demo.
+        setLoadError(
+          error instanceof Error
+            ? error.message
+            : String(error)
         );
       }
-    }
-
-    // =====================================
-    // ROAD-SNAP TRAJECTORY
-    // Replace every hop LineString's straight
-    // coordinates with OSRM road geometry.
-    // Falls back silently per-feature on error.
-    // =====================================
-
-    async function snapToRoads(
-      collection: TrajectoryCollection
-    ): Promise<TrajectoryCollection> {
-      const snapped = await Promise.all(
-        collection.features.map(async (feature) => {
-          // Only process LineString hops
-          if (feature.geometry.type !== "LineString") {
-            return feature;
-          }
-
-          const coords =
-            feature.geometry.coordinates as [
-              number,
-              number,
-            ][];
-
-          const from = coords[0] as [
-            number,
-            number,
-          ];
-          const to = coords[
-            coords.length - 1
-          ] as [number, number];
-
-          try {
-            const roadCoords =
-              await getRoadRoute(from, to);
-
-            return {
-              ...feature,
-              geometry: {
-                ...feature.geometry,
-                coordinates: roadCoords,
-              },
-            };
-          } catch {
-            // OSRM unavailable — keep straight line
-            return feature;
-          }
-        })
-      );
-
-      return {
-        ...collection,
-        features:
-          snapped as TrajectoryFeature[],
-      };
     }
 
     // =====================================
     // LOAD TRAJECTORY
+    //
+    // Without a vehicle to follow there is no
+    // honest trajectory to draw, so the layer
+    // stays empty rather than inventing one.
+    //
+    // The backend already returns road geometry
+    // and labels it geometry_source: "road", so
+    // there is nothing to snap here either.
     // =====================================
 
     async function loadTrajectory() {
-      let raw: TrajectoryCollection;
-
-      try {
-        raw = await getVehicleTrajectory(
-          DEFAULT_VEHICLE_ID
-        );
-        setDataMode("backend");
-      } catch {
-        raw = mockTrajectoryGeoJson;
-        setDataMode("demo");
+      if (vehicleId === undefined) {
+        return;
       }
 
-      if (disposed) return;
+      try {
+        const response =
+          await getVehicleTrajectory(
+            vehicleId
+          );
 
-      // Snap hops to real roads
-      const roadSnapped =
-        await snapToRoads(raw);
+        if (disposed) {
+          return;
+        }
 
-      if (disposed) return;
+        renderTrajectoryLayer(
+          response.geojson
+        );
+        setLoadError(null);
+      } catch (error) {
+        if (disposed) {
+          return;
+        }
 
-      renderTrajectoryLayer(roadSnapped);
+        setLoadError(
+          error instanceof Error
+            ? error.message
+            : String(error)
+        );
+      }
     }
 
     // =====================================
     // LOAD TRAFFIC
+    //
+    // from/to come from the page. Passing
+    // neither is the live path: the backend
+    // defaults to the last 15 minutes, which
+    // is exactly what live mode means.
     // =====================================
 
     async function loadTraffic() {
       try {
-        const now =
-          new Date();
-
-        const fifteenMinutesAgo =
-          new Date(
-            now.getTime() -
-              15 *
-                60 *
-                1000
-          );
-
         const traffic =
           await getTrafficHeatmap(
-            fifteenMinutesAgo.toISOString(),
-            now.toISOString()
+            fromRef.current,
+            toRef.current
           );
 
         if (disposed) {
           return;
         }
 
-        renderTrafficLayer(
-          traffic
-        );
-      } catch {
+        renderTrafficLayer(traffic);
+        setLoadError(null);
+      } catch (error) {
         if (disposed) {
           return;
         }
 
-        renderTrafficLayer(
-          mockTrafficGeoJson
+        setLoadError(
+          error instanceof Error
+            ? error.message
+            : String(error)
         );
       }
     }
 
     // =====================================
     // INITIAL DATA LOAD
+    //
+    // Cameras first and awaited, because the
+    // sighting pulses below need the position
+    // lookup it builds.
     // =====================================
 
-    loadCameras();
-    loadTrajectory();
-    loadTraffic();
+    loadCameras().then(() => {
+      if (!disposed) {
+        loadTrajectory();
+        loadTraffic();
+      }
+    });
+
+    reloadTrafficRef.current = loadTraffic;
 
     // =====================================
     // TRAFFIC POLLING
@@ -758,75 +923,13 @@ export default function CityMap({
       );
 
     // =====================================
-    // LIVE SSE
+    // LIVE MARKERS
+    //
+    // The pulse CSS is injected once per
+    // document rather than per map, so two
+    // mounted maps share one style element.
     // =====================================
 
-    const stream =
-      connectLiveStream(
-        (event) => {
-          if (disposed) {
-            return;
-          }
-
-          handleLiveEvent(
-            event
-          );
-
-          setLastEvent(
-            event.event
-          );
-        },
-
-        () => {
-          if (!disposed) {
-            setStreamStatus(
-              "connected"
-            );
-          }
-        },
-
-        () => {
-          if (!disposed) {
-            setStreamStatus(
-              "disconnected"
-            );
-          }
-        }
-      );
-
-    function handleLiveEvent(
-      event: LiveEvent
-    ) {
-      if (
-        event.event ===
-        "new_sighting"
-      ) {
-        loadTrajectory();
-      }
-
-      if (
-        event.event ===
-        "new_alert"
-      ) {
-        console.log(
-          "New alert:",
-          event.data
-        );
-      }
-    }
-
-    // =====================================
-    // MAP RESIZE
-    // =====================================
-
-    // =====================================
-    // DEMO LIVE SIMULATION
-    // Cycles a pulsing vehicle marker through
-    // each vehicle's camera waypoints so the
-    // map feels alive when there is no backend.
-    // =====================================
-
-    // Inject pulse keyframe CSS once
     if (!document.getElementById("ci-pulse-style")) {
       const styleEl = document.createElement("style");
       styleEl.id = "ci-pulse-style";
@@ -845,59 +948,167 @@ export default function CityMap({
           box-shadow: 0 0 8px rgba(34,197,94,.6);
           animation: ci-pulse 1.5s ease-in-out infinite;
         }
+        .ci-alert-ring {
+          width: 22px;
+          height: 22px;
+          border-radius: 50%;
+          background: rgba(239,68,68,0.85);
+          border: 2.5px solid #fff;
+          box-shadow: 0 0 12px rgba(239,68,68,.7);
+          animation: ci-pulse 1.1s ease-in-out infinite;
+        }
       `;
       document.head.appendChild(styleEl);
     }
 
-    const pulsingIcon = L.divIcon({
+    const sightingIcon = L.divIcon({
       className: "",
       html: `<div class="ci-pulse-ring"></div>`,
       iconSize: [18, 18],
       iconAnchor: [9, 9],
     });
 
-    // Flatten all routes into one sequence:
-    // each entry: { vehicleId, cameraId, latlng }
-    const sequence = DEMO_VEHICLE_ROUTES.flatMap((route) =>
-      route.cameraIds.map((camId, idx) => ({
-        vehicleId: route.vehicleId,
-        cameraId:  camId,
-        latlng:    [
-          route.waypoints[idx][1], // lat
-          route.waypoints[idx][0], // lng
-        ] as [number, number],
-        cameraName: CAMERA_BY_ID[camId]?.name ?? camId,
-      }))
-    );
+    const alertIcon = L.divIcon({
+      className: "",
+      html: `<div class="ci-alert-ring"></div>`,
+      iconSize: [22, 22],
+      iconAnchor: [11, 11],
+    });
 
-    let seqIndex = 0;
-
-    function advanceLiveMarker() {
-      if (disposed || !mapRef.current) return;
-
-      const step = sequence[seqIndex];
-      seqIndex = (seqIndex + 1) % sequence.length;
-
-      if (liveMarkerRef.current) {
-        liveMarkerRef.current.setLatLng(step.latlng);
-      } else {
-        liveMarkerRef.current = L.marker(
-          step.latlng,
-          { icon: pulsingIcon, zIndexOffset: 2000 }
-        ).addTo(map);
+    /**
+     * Drops a marker that removes itself. Every
+     * marker is also tracked so unmount can clear
+     * whatever is still pulsing.
+     */
+    function dropTransientMarker(
+      position: [number, number],
+      icon: L.DivIcon,
+      popup: string | null,
+      lifetimeMs: number
+    ) {
+      if (disposed || !mapRef.current) {
+        return;
       }
 
-      setLiveLabel(
-        `${step.vehicleId} · ${step.cameraName}`
-      );
+      const marker = L.marker(position, {
+        icon,
+        zIndexOffset: 2000,
+      });
+
+      if (popup) {
+        marker.bindPopup(popup);
+      }
+
+      marker.addTo(mapRef.current);
+      liveMarkersRef.current.add(marker);
+
+      window.setTimeout(() => {
+        liveMarkersRef.current.delete(marker);
+        marker.remove();
+      }, lifetimeMs);
     }
 
-    // Start immediately then every 6 s
-    advanceLiveMarker();
-    const liveTimer = window.setInterval(
-      advanceLiveMarker,
-      6_000
-    );
+    // =====================================
+    // LIVE SSE
+    //
+    // Events are named on the wire, so they
+    // arrive through addEventListener rather
+    // than onmessage. Only events newer than
+    // the backend's 60 s live window are ever
+    // sent, so a backfill never floods this.
+    // =====================================
+
+    const stream = connectLiveStream({
+      onOpen: () => {
+        if (!disposed) {
+          setStreamStatus("connected");
+        }
+      },
+
+      onError: () => {
+        if (!disposed) {
+          setStreamStatus("disconnected");
+        }
+      },
+
+      onSighting: (data) => {
+        if (disposed) {
+          return;
+        }
+
+        setLastEvent(
+          `sighting · ${data.camera_id}${
+            data.plate ? ` · ${data.plate}` : ""
+          }`
+        );
+
+        const position =
+          cameraPositionsRef.current.get(
+            data.camera_id
+          );
+
+        if (position) {
+          dropTransientMarker(
+            position,
+            sightingIcon,
+            `<strong>${
+              data.plate ?? "plate unreadable"
+            }</strong><br/>vehicle ${
+              data.vehicle_id
+            }<br/>${data.camera_id}`,
+            SIGHTING_PULSE_MS
+          );
+        }
+
+        // Only redraw when the vehicle on screen
+        // is the one that was just seen.
+        if (
+          vehicleId !== undefined &&
+          data.vehicle_id === vehicleId
+        ) {
+          loadTrajectory();
+        }
+      },
+
+      onAlert: (data) => {
+        if (disposed) {
+          return;
+        }
+
+        setLastEvent(
+          `alert · ${data.alert_type}`
+        );
+
+        // The alert payload carries its own
+        // position, so an alert pins the map even
+        // for a camera the lookup does not know.
+        const position: [number, number] | null =
+          data.lat !== null && data.lon !== null
+            ? [data.lat, data.lon]
+            : cameraPositionsRef.current.get(
+                data.camera_id ?? ""
+              ) ?? null;
+
+        if (position) {
+          dropTransientMarker(
+            position,
+            alertIcon,
+            `<strong>${data.alert_type}</strong> (${
+              data.severity
+            })<br/>${data.message}<br/>${
+              data.camera_name ??
+              data.camera_id ??
+              ""
+            }`,
+            ALERT_PIN_MS
+          );
+        }
+      },
+    });
+
+    // =====================================
+    // MAP RESIZE
+    // =====================================
 
     const resizeTimer =
       window.setTimeout(
@@ -929,10 +1140,10 @@ export default function CityMap({
 
       stream.close();
 
-      window.clearInterval(liveTimer);
-
-      liveMarkerRef.current?.remove();
-      liveMarkerRef.current = null;
+      liveMarkers.forEach((marker) =>
+        marker.remove()
+      );
+      liveMarkers.clear();
 
       cameraLayerRef.current?.remove();
       trajectoryLayerRef.current?.remove();
@@ -990,6 +1201,26 @@ export default function CityMap({
      */
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // =====================================
+  // TRAFFIC WINDOW
+  //
+  // The page owns the range; the map just
+  // refetches when it moves. The init effect has
+  // already done the first load, so this only
+  // fires on an actual change.
+  // =====================================
+
+  const trafficWindowSettled = useRef(false);
+
+  useEffect(() => {
+    if (!trafficWindowSettled.current) {
+      trafficWindowSettled.current = true;
+      return;
+    }
+
+    reloadTrafficRef.current?.();
+  }, [from, to]);
 
   // =====================================
   // CAMERA TOGGLE
@@ -1149,13 +1380,30 @@ export default function CityMap({
             color: "#cbd5e1",
           }}
         >
-          Data:{" "}
-          <strong>
-            {dataMode ===
-            "backend"
-              ? "Backend"
-              : "Demo GeoJSON"}
-          </strong>
+          {loadError ? (
+            <strong
+              style={{ color: "#ef4444" }}
+            >
+              Backend unreachable
+            </strong>
+          ) : (
+            <>
+              <strong>
+                {cameraSet || "Loading"}
+              </strong>
+
+              {cameraCount > 0 && (
+                <span
+                  style={{
+                    color: "#64748b",
+                  }}
+                >
+                  {" · "}
+                  {cameraCount} cameras
+                </span>
+              )}
+            </>
+          )}
         </div>
 
         <div
@@ -1213,28 +1461,16 @@ export default function CityMap({
           </strong>
         </div>
 
-        {liveLabel && (
+        {loadError && (
           <div
             style={{
               marginTop: "7px",
               fontSize: "10px",
-              display: "flex",
-              alignItems: "center",
-              gap: "6px",
-              color: "#4ade80",
-              fontWeight: 600,
+              lineHeight: 1.45,
+              color: "#f87171",
             }}
           >
-            <span
-              style={{
-                width: "7px",
-                height: "7px",
-                borderRadius: "50%",
-                background: "#22c55e",
-                flexShrink: 0,
-              }}
-            />
-            {liveLabel}
+            {loadError}
           </div>
         )}
       </div>
@@ -1330,7 +1566,7 @@ export default function CityMap({
           <>
             <LegendLine
               color="#22c55e"
-              label="Normal"
+              label="Free flowing"
             />
 
             <LegendLine
@@ -1350,7 +1586,7 @@ export default function CityMap({
 
             <LegendLine
               color="#94a3b8"
-              label="Low samples"
+              label="Too few samples to band"
             />
           </>
         )}
@@ -1401,29 +1637,41 @@ export default function CityMap({
 // CAMERA HEALTH
 // =====================================
 
+function minutesSince(
+  timestamp: string | null
+): number | null {
+  if (!timestamp) {
+    return null;
+  }
+
+  const seen = new Date(timestamp).getTime();
+
+  if (Number.isNaN(seen)) {
+    return null;
+  }
+
+  return (Date.now() - seen) / 1000 / 60;
+}
+
 function getCameraHealthColor(
-  lastSeenAt: string
+  lastEventAt: string | null,
+  isActive = true
 ) {
-  const lastSeen =
-    new Date(
-      lastSeenAt
-    ).getTime();
+  if (!isActive) {
+    return "#475569";
+  }
 
-  const minutesSinceSeen =
-    (Date.now() -
-      lastSeen) /
-    1000 /
-    60;
+  const since = minutesSince(lastEventAt);
 
-  if (
-    minutesSinceSeen <= 5
-  ) {
+  if (since === null) {
+    return "#94a3b8";
+  }
+
+  if (since <= 5) {
     return "#22c55e";
   }
 
-  if (
-    minutesSinceSeen <= 15
-  ) {
+  if (since <= 15) {
     return "#f59e0b";
   }
 
@@ -1431,28 +1679,24 @@ function getCameraHealthColor(
 }
 
 function getCameraHealthLabel(
-  lastSeenAt: string
+  lastEventAt: string | null,
+  isActive = true
 ) {
-  const lastSeen =
-    new Date(
-      lastSeenAt
-    ).getTime();
+  if (!isActive) {
+    return "Deactivated";
+  }
 
-  const minutesSinceSeen =
-    (Date.now() -
-      lastSeen) /
-    1000 /
-    60;
+  const since = minutesSince(lastEventAt);
 
-  if (
-    minutesSinceSeen <= 5
-  ) {
+  if (since === null) {
+    return "Never reported";
+  }
+
+  if (since <= 5) {
     return "Online";
   }
 
-  if (
-    minutesSinceSeen <= 15
-  ) {
+  if (since <= 15) {
     return "Delayed";
   }
 
@@ -1472,16 +1716,21 @@ function getTrajectoryStyle(
     detour_suspected,
   } = feature.properties;
 
-  const color =
-    detour_suspected
-      ? "#f59e0b"
-      : "#2563eb";
+  const color = detour_suspected
+    ? "#f59e0b"
+    : "#2563eb";
+
+  // An unknown confidence is drawn faintly rather
+  // than confidently: the link exists, but the
+  // resolver could not score it.
+  const confidence = link_confidence ?? 0;
 
   const opacity =
-    link_confidence < 0.5
+    link_confidence === null
+      ? 0.3
+      : confidence < 0.5
       ? 0.35
-      : link_confidence <
-          0.75
+      : confidence < 0.75
       ? 0.65
       : 1;
 
@@ -1490,8 +1739,7 @@ function getTrajectoryStyle(
     weight: 5,
     opacity,
     dashArray:
-      skipped_cameras.length >
-      0
+      skipped_cameras.length > 0
         ? "8 8"
         : undefined,
   };
@@ -1504,16 +1752,15 @@ function getTrajectoryStyle(
 function getTrafficStyle(
   feature: TrafficFeature
 ): PathOptions {
-  const {
-    congestion_band,
-    sample_count,
-    weight,
-  } = feature.properties;
+  const { congestion_band, weight } =
+    feature.properties;
 
-  if (
-    sample_count <
-    MIN_TRAFFIC_SAMPLE_COUNT
-  ) {
+  // A null band is the backend saying this edge was
+  // traversed fewer than analytics.min-samples times
+  // and it will not claim a congestion level for it.
+  // Grey is the honest colour for that; inventing a
+  // second, disagreeing threshold here is not.
+  if (congestion_band === null) {
     return {
       color: "#94a3b8",
       weight: 4,
@@ -1521,41 +1768,19 @@ function getTrafficStyle(
     };
   }
 
-  let color =
-    "#22c55e";
+  const color =
+    congestion_band === "moderate"
+      ? "#eab308"
+      : congestion_band === "heavy"
+      ? "#f97316"
+      : congestion_band === "severe"
+      ? "#ef4444"
+      : "#22c55e";
 
-  if (
-    congestion_band ===
-    "moderate"
-  ) {
-    color =
-      "#eab308";
-  }
-
-  if (
-    congestion_band ===
-    "heavy"
-  ) {
-    color =
-      "#f97316";
-  }
-
-  if (
-    congestion_band ===
-    "severe"
-  ) {
-    color =
-      "#ef4444";
-  }
-
-  const lineWidth =
-    Math.max(
-      3,
-      Math.min(
-        10,
-        3 + weight / 25
-      )
-    );
+  const lineWidth = Math.max(
+    3,
+    Math.min(10, 3 + weight / 25)
+  );
 
   return {
     color,
@@ -1569,8 +1794,12 @@ function getTrafficStyle(
 // =====================================
 
 function formatDateTime(
-  value: string
+  value: string | null
 ) {
+  if (!value) {
+    return "never";
+  }
+
   const date =
     new Date(value);
 
@@ -1583,6 +1812,25 @@ function formatDateTime(
   }
 
   return date.toLocaleString();
+}
+
+function formatSeconds(
+  seconds: number | null
+) {
+  if (seconds === null) {
+    return "unknown";
+  }
+
+  if (seconds < 60) {
+    return `${Math.round(seconds)}s`;
+  }
+
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+
+  return rest === 0
+    ? `${minutes}m`
+    : `${minutes}m ${rest}s`;
 }
 
 // =====================================

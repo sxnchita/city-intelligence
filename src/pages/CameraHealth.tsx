@@ -1,11 +1,19 @@
 import { useMemo, useState } from "react";
 
 import Sidebar from "../components/layout/Sidebar";
+import ConnectionBadge, {
+  connectionState,
+} from "../components/common/ConnectionBadge";
+import EmptyState, {
+  OFFLINE_HINT,
+} from "../components/common/EmptyState";
+import { useApiData } from "../hooks/useApiData";
+import { getCameras } from "../services/mapApi";
+import type { CameraCollection } from "../services/mapApi";
 import {
-  ALL_CAMERAS,
-  CAMERA_ZONES,
-  cameraStatus,
-} from "../data/cameras";
+  getSystemHealth,
+  type SystemHealth,
+} from "../services/systemApi";
 
 type CameraStatus =
   | "online"
@@ -19,36 +27,166 @@ type CameraItem = {
   heading: number;
   lastSeen: string;
   status: CameraStatus;
+  isActive: boolean;
 };
 
-// Build camera list from shared registry
-function formatLastSeen(minutesOffline: number): string {
-  if (minutesOffline === 0) return "< 1 min ago";
-  if (minutesOffline < 60) return `${minutesOffline} min ago`;
-  return `${Math.floor(minutesOffline / 60)}h ago`;
+function formatLastSeen(
+  minutesOffline: number
+): string {
+  if (minutesOffline === 0)
+    return "< 1 min ago";
+  if (minutesOffline < 60)
+    return `${minutesOffline} min ago`;
+  return `${Math.floor(
+    minutesOffline / 60
+  )}h ago`;
 }
 
-const cameras: CameraItem[] = ALL_CAMERAS.map((c) => ({
-  id:       c.id,
-  name:     c.name,
-  zone:     c.zone,
-  heading:  c.heading,
-  lastSeen: formatLastSeen(c.minutesOffline),
-  status:   cameraStatus(c.minutesOffline),
-}));
+/** Minutes since a timestamp; large when never seen. */
+function minutesSince(
+  timestamp: string | null
+): number {
+  if (!timestamp) {
+    return Number.MAX_SAFE_INTEGER;
+  }
 
-type ZoneFilter = typeof CAMERA_ZONES[number];
+  const seen = new Date(timestamp).getTime();
 
-type StatusFilter =
-  | "all"
-  | CameraStatus;
+  if (Number.isNaN(seen)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  return Math.max(
+    0,
+    Math.round((Date.now() - seen) / 60000)
+  );
+}
+
+/**
+ * Health is derived from the camera's own
+ * last_event_at, which is what the backend
+ * maintains as events arrive. A camera that has
+ * gone quiet for a quarter of an hour is silent
+ * whatever its is_active flag says.
+ */
+function cameraStatus(
+  minutesOffline: number
+): CameraStatus {
+  if (minutesOffline <= 5) return "online";
+  if (minutesOffline <= 15) return "delayed";
+  return "silent";
+}
+
+function toCameraItems(
+  collection: CameraCollection
+): CameraItem[] {
+  return collection.features.map((feature) => {
+    const p = feature.properties;
+    const offline = minutesSince(
+      p.last_event_at
+    );
+
+    return {
+      id: p.camera_id,
+      name: p.name,
+      zone: p.zone,
+      heading: p.heading_degrees,
+      lastSeen: p.last_event_at
+        ? formatLastSeen(offline)
+        : "never",
+      status: cameraStatus(offline),
+      isActive: p.is_active,
+    };
+  });
+}
+
+// Camera health only moves when events arrive, so
+// this polls on the same cadence as the rest of
+// live mode.
+const REFRESH_MS = 15_000;
+
+function IngestFact({
+  label,
+  value,
+  alarming = false,
+}: {
+  label: string;
+  value: string;
+  alarming?: boolean;
+}) {
+  return (
+    <span>
+      <span
+        style={{
+          textTransform: "uppercase",
+          letterSpacing: ".5px",
+          fontSize: "10px",
+          color: "#64748b",
+        }}
+      >
+        {label}
+      </span>{" "}
+      <strong
+        style={{
+          color: alarming
+            ? "#f87171"
+            : "#e2e8f0",
+        }}
+      >
+        {value}
+      </strong>
+    </span>
+  );
+}
+
+type StatusFilter = "all" | CameraStatus;
 
 export default function CameraHealth() {
+  const {
+    data: fetchedCameras,
+    loading,
+    error,
+  } = useApiData<CameraItem[]>(
+    async (signal) =>
+      toCameraItems(
+        await getCameras(signal)
+      ),
+    [],
+    { refreshMs: REFRESH_MS }
+  );
+
+  const cameras = useMemo(
+    () => fetchedCameras ?? [],
+    [fetchedCameras]
+  );
+
+  // "Is anything actually arriving?" -- the counters
+  // the ingest path maintains, including failures
+  // that were caught and swallowed.
+  const { data: health } =
+    useApiData<SystemHealth>(
+      (signal) => getSystemHealth(signal),
+      [],
+      { refreshMs: REFRESH_MS }
+    );
+
+  // Zones come from whatever the backend is
+  // serving, so this page follows the city.
+  const zones = useMemo(
+    () => [
+      "all",
+      ...Array.from(
+        new Set(cameras.map((c) => c.zone))
+      ).sort(),
+    ],
+    [cameras]
+  );
+
   const [searchValue, setSearchValue] =
     useState("");
 
   const [zoneFilter, setZoneFilter] =
-    useState<ZoneFilter>("all");
+    useState<string>("all");
 
   const [statusFilter, setStatusFilter] =
     useState<StatusFilter>("all");
@@ -91,6 +229,7 @@ export default function CameraHealth() {
         }
       );
     }, [
+      cameras,
       searchValue,
       zoneFilter,
       statusFilter,
@@ -156,11 +295,29 @@ export default function CameraHealth() {
           <div>
             <div
               style={{
-                fontSize: "24px",
-                fontWeight: 750,
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
               }}
             >
-              Camera Health
+              <div
+                style={{
+                  fontSize: "24px",
+                  fontWeight: 750,
+                }}
+              >
+                Camera Health
+              </div>
+
+              <ConnectionBadge
+                state={connectionState({
+                  loading,
+                  error,
+                })}
+                title={
+                  error ? error.message : undefined
+                }
+              />
             </div>
 
             <div
@@ -184,8 +341,7 @@ export default function CameraHealth() {
               value={zoneFilter}
               onChange={(event) =>
                 setZoneFilter(
-                  event.target
-                    .value as ZoneFilter
+                  event.target.value
                 )
               }
               style={{
@@ -199,7 +355,7 @@ export default function CameraHealth() {
                 outline: "none",
               }}
             >
-              {CAMERA_ZONES.map((z) => (
+              {zones.map((z) => (
                 <option key={z} value={z}>
                   {z === "all" ? "All zones" : z}
                 </option>
@@ -287,6 +443,70 @@ export default function CameraHealth() {
             color="#94a3b8"
           />
         </div>
+
+        {/* INGEST HEALTH */}
+
+        {health && (
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "18px",
+              alignItems: "baseline",
+              background: "#091828",
+              border:
+                "1px solid rgba(255,255,255,0.07)",
+              borderRadius: "13px",
+              padding: "12px 16px",
+              marginBottom: "14px",
+              fontSize: "11px",
+              color: "#94a3b8",
+            }}
+          >
+            <IngestFact
+              label="Observations"
+              value={health.observation_count.toLocaleString()}
+            />
+
+            <IngestFact
+              label="Last ingest"
+              value={
+                health.last_ingest_at
+                  ? formatLastSeen(
+                      minutesSince(
+                        health.last_ingest_at
+                      )
+                    )
+                  : "never"
+              }
+            />
+
+            <IngestFact
+              label="Rejected events"
+              value={health.reject_count.toLocaleString()}
+              alarming={health.reject_count > 0}
+            />
+
+            {/* A climbing counter here means work is
+                being lost silently, which is worth
+                showing even when nothing looks wrong. */}
+            {Object.entries(
+              health.failures
+            )
+              .filter(([, n]) => n > 0)
+              .map(([name, n]) => (
+                <IngestFact
+                  key={name}
+                  label={name.replace(
+                    /_/g,
+                    " "
+                  )}
+                  value={String(n)}
+                  alarming
+                />
+              ))}
+          </div>
+        )}
 
         {/* MAIN CONTENT */}
 
@@ -406,18 +626,25 @@ export default function CameraHealth() {
                 )
               )
             ) : (
-              <div
-                style={{
-                  padding: "28px 8px",
-                  textAlign: "center",
-                  color: "#64748b",
-                  fontSize: "11px",
-                  borderTop:
-                    "1px solid rgba(255,255,255,.05)",
-                }}
-              >
-                No cameras match the current filters.
-              </div>
+              <EmptyState
+                title={
+                  error
+                    ? "Camera list unavailable"
+                    : cameras.length === 0
+                    ? "No cameras"
+                    : "No cameras match the current filters"
+                }
+                detail={
+                  error
+                    ? OFFLINE_HINT
+                    : cameras.length === 0
+                    ? "The backend reported no active cameras for this camera set."
+                    : undefined
+                }
+                tone={
+                  error ? "error" : "neutral"
+                }
+              />
             )}
           </section>
 

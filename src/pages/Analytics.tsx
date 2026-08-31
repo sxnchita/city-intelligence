@@ -1,4 +1,18 @@
 import Sidebar from "../components/layout/Sidebar";
+import ConnectionBadge, {
+  connectionState,
+} from "../components/common/ConnectionBadge";
+import EmptyState, {
+  NO_DATA_HINT,
+  OFFLINE_HINT,
+} from "../components/common/EmptyState";
+import { useApiData } from "../hooks/useApiData";
+import {
+  getCongestion,
+  getDensity,
+  getOd,
+  getSummary,
+} from "../services/analyticsApi";
 
 import {
   Bar,
@@ -12,39 +26,290 @@ import {
   YAxis,
 } from "recharts";
 
-const speedData = [
-  { time: "18:00", speed: 42 },
-  { time: "19:00", speed: 39 },
-  { time: "20:00", speed: 35 },
-  { time: "21:00", speed: 31 },
-  { time: "22:00", speed: 28 },
-  { time: "23:00", speed: 33 },
-];
+type AnalyticsData = {
+  totalObservations: number;
+  /**
+   * Distinct vehicles, from the OD coverage
+   * denominator -- the only vehicle-keyed count the
+   * analytics API exposes. summary.unique_vehicles
+   * is NOT one: it sums per-camera bucket counts and
+   * tracks the observation total instead.
+   */
+  vehiclesTracked: number;
+  camerasReporting: number;
+  topFlowCount: number;
+  topFlowLabel: string;
 
-const flowData = [
-  {
-    route: "Central → East",
-    vehicles: 420,
-  },
-  {
-    route: "West → Central",
-    vehicles: 365,
-  },
-  {
-    route: "North → Central",
-    vehicles: 310,
-  },
-  {
-    route: "Central → South",
-    vehicles: 284,
-  },
-  {
-    route: "East → South",
-    vehicles: 248,
-  },
-];
+  /** Observations per bucket, city-wide. */
+  volumeSeries: {
+    time: string;
+    observations: number;
+    vehicles: number;
+  }[];
+
+  flowSeries: {
+    route: string;
+    vehicles: number;
+  }[];
+
+  corridors: {
+    name: string;
+    speed: string;
+    travelTime: string;
+    status: string;
+    color: string;
+  }[];
+
+  coverageFraction: number | null;
+  coverageNote: string;
+  coverageObserved: number;
+  coverageUsable: number;
+};
+
+const BAND_COLOR: Record<string, string> = {
+  free: "#22c55e",
+  moderate: "#eab308",
+  heavy: "#f97316",
+  severe: "#ef4444",
+};
+
+const BAND_LABEL: Record<string, string> = {
+  free: "Free flowing",
+  moderate: "Moderate",
+  heavy: "Heavy",
+  severe: "Severe",
+};
+
+function bucketLabel(iso: string): string {
+  const date = new Date(iso);
+
+  return Number.isNaN(date.getTime())
+    ? iso
+    : date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+}
+
+/**
+ * Corridor speed is derived, not measured: the
+ * backend reports distance and median duration
+ * per edge, and speed follows from those.
+ */
+function kmh(
+  distanceM: number | null,
+  durationS: number | null
+): string {
+  if (!distanceM || !durationS) {
+    return "\u2014";
+  }
+
+  return `${Math.round(
+    (distanceM / durationS) * 3.6
+  )} km/h`;
+}
+
+function minutes(
+  durationS: number | null
+): string {
+  return durationS === null
+    ? "\u2014"
+    : `${Math.round(durationS / 60)} min`;
+}
+
+const NOTHING_YET: AnalyticsData = {
+  totalObservations: 0,
+  vehiclesTracked: 0,
+  camerasReporting: 0,
+  topFlowCount: 0,
+  topFlowLabel: "\u2014",
+  volumeSeries: [],
+  flowSeries: [],
+  corridors: [],
+  coverageFraction: null,
+  coverageNote: "",
+  coverageObserved: 0,
+  coverageUsable: 0,
+};
+
+/**
+ * The density endpoint buckets at
+ * analytics.density-bucket-minutes, which is 5.
+ * Over a 24-hour window that is 288 points, which
+ * is unreadable as a trend line, so they are
+ * folded into hours here. There is no server-side
+ * bucket size to ask for: AnalyticsController only
+ * accepts from, to and camera_id.
+ */
+function toHourlyBuckets(
+  points: {
+    bucket_start: string;
+    observation_count: number;
+    unique_vehicle_count: number;
+  }[]
+): {
+  time: string;
+  observations: number;
+  vehicles: number;
+}[] {
+  const hours = new Map<
+    number,
+    { observations: number; vehicles: number }
+  >();
+
+  for (const point of points) {
+    const at = new Date(point.bucket_start);
+
+    if (Number.isNaN(at.getTime())) {
+      continue;
+    }
+
+    at.setMinutes(0, 0, 0);
+
+    const key = at.getTime();
+
+    const bucket = hours.get(key) ?? {
+      observations: 0,
+      vehicles: 0,
+    };
+
+    bucket.observations +=
+      point.observation_count;
+
+    // Unique vehicles do not sum across buckets --
+    // one vehicle seen in three of them is one
+    // vehicle. The hourly figure is therefore an
+    // upper bound, and the label says "sightings"
+    // for the honest number.
+    bucket.vehicles +=
+      point.unique_vehicle_count;
+
+    hours.set(key, bucket);
+  }
+
+  return [...hours.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([key, value]) => ({
+      time: bucketLabel(
+        new Date(key).toISOString()
+      ),
+      observations: value.observations,
+      vehicles: value.vehicles,
+    }));
+}
 
 export default function Analytics() {
+  const {
+    data: fetched,
+    loading,
+    error,
+  } = useApiData<AnalyticsData>(
+      async (signal) => {
+        // A day-wide window: the 15-minute
+        // default is too short to draw a trend.
+        const from = new Date(
+          Date.now() - 24 * 60 * 60 * 1000
+        ).toISOString();
+        const to = new Date().toISOString();
+
+        const [
+          summary,
+          density,
+          od,
+          congestion,
+        ] = await Promise.all([
+          getSummary(from, to, signal),
+          getDensity(
+            from,
+            to,
+            undefined,
+            signal
+          ),
+          getOd(from, to, signal),
+          getCongestion(from, to, 4, signal),
+        ]);
+
+        // camera_id is null on the synthetic
+        // city-wide series.
+        const cityWide =
+          density.series.find(
+            (series) =>
+              series.camera_id === null
+          ) ?? density.series[0];
+
+        const flows = [...od.matrix]
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 5)
+          .map((cell) => ({
+            route: `${cell.origin} \u2192 ${cell.destination}`,
+            vehicles: cell.count,
+          }));
+
+        return {
+          totalObservations:
+            summary.total_observations,
+          vehiclesTracked:
+            od.coverage.vehicles_observed,
+          camerasReporting:
+            summary.active_cameras_reporting,
+          topFlowCount:
+            flows[0]?.vehicles ?? 0,
+          topFlowLabel:
+            flows[0]?.route ?? "\u2014",
+
+          volumeSeries: toHourlyBuckets(
+            cityWide?.points ?? []
+          ),
+
+          flowSeries: flows,
+
+          corridors: congestion.rows.map(
+            (row) => ({
+              name: `${
+                row.from_camera_name ??
+                row.from_camera_id
+              } \u2192 ${
+                row.to_camera_name ??
+                row.to_camera_id
+              }`,
+              // The congestion endpoint has no
+              // distance, so speed is left out
+              // rather than invented.
+              speed: kmh(
+                null,
+                row.median_duration_s
+              ),
+              travelTime: minutes(
+                row.median_duration_s
+              ),
+              status: row.congestion_band
+                ? BAND_LABEL[
+                    row.congestion_band
+                  ]
+                : "Unbanded",
+              color: row.congestion_band
+                ? BAND_COLOR[
+                    row.congestion_band
+                  ]
+                : "#94a3b8",
+            })
+          ),
+
+          coverageFraction:
+            od.coverage.coverage_fraction,
+          coverageNote: od.coverage.note,
+          coverageObserved:
+            od.coverage.vehicles_observed,
+          coverageUsable:
+            od.coverage
+              .vehicles_with_both_ends,
+        };
+      },
+      []
+    );
+
+  const data = fetched ?? NOTHING_YET;
+
   return (
     <div
       style={{
@@ -82,9 +347,22 @@ export default function Analytics() {
               style={{
                 fontSize: "24px",
                 fontWeight: 750,
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
               }}
             >
               Analytics
+
+              <ConnectionBadge
+                state={connectionState({
+                  loading,
+                  error,
+                })}
+                title={
+                  error ? error.message : undefined
+                }
+              />
             </div>
 
             <div
@@ -138,26 +416,28 @@ export default function Analytics() {
         >
           <Kpi
             label="Total Observations"
-            value="18,420"
-            detail="Today"
+            value={data.totalObservations.toLocaleString()}
+            detail="Last 24 hours"
           />
 
           <Kpi
-            label="Unique Vehicles"
-            value="6,281"
-            detail="Estimated"
+            label="Vehicles Tracked"
+            value={data.vehiclesTracked.toLocaleString()}
+            detail={`${data.coverageUsable.toLocaleString()} usable for OD flows`}
           />
 
           <Kpi
-            label="Average Speed"
-            value="32 km/h"
-            detail="Across corridors"
+            label="Cameras Reporting"
+            value={String(
+              data.camerasReporting
+            )}
+            detail="Across the network"
           />
 
           <Kpi
             label="Top OD Flow"
-            value="420"
-            detail="Central → East"
+            value={data.topFlowCount.toLocaleString()}
+            detail={data.topFlowLabel}
           />
         </div>
 
@@ -173,15 +453,34 @@ export default function Analytics() {
           }}
         >
           <ChartCard
-            title="Average Corridor Speed"
-            subtitle="Hourly speed trend"
+            title="Observation Volume"
+            subtitle="Sightings per hour, city-wide"
           >
+            {data.volumeSeries.length === 0 && (
+              <EmptyState
+                title={
+                  error
+                    ? "Density unavailable"
+                    : "No observations"
+                }
+                detail={
+                  error
+                    ? OFFLINE_HINT
+                    : NO_DATA_HINT
+                }
+                tone={
+                  error ? "error" : "neutral"
+                }
+              />
+            )}
+
+            {data.volumeSeries.length > 0 && (
             <ResponsiveContainer
               width="100%"
               height={280}
             >
               <LineChart
-                data={speedData}
+                data={data.volumeSeries}
                 margin={{
                   top: 10,
                   right: 20,
@@ -223,7 +522,7 @@ export default function Analytics() {
 
                 <Line
                   type="monotone"
-                  dataKey="speed"
+                  dataKey="observations"
                   stroke="#38bdf8"
                   strokeWidth={3}
                   dot={{
@@ -233,18 +532,38 @@ export default function Analytics() {
                 />
               </LineChart>
             </ResponsiveContainer>
+            )}
           </ChartCard>
 
           <ChartCard
             title="Top Origin-Destination Flows"
             subtitle="Highest vehicle movement pairs"
           >
+            {data.flowSeries.length === 0 && (
+              <EmptyState
+                title={
+                  error
+                    ? "Flows unavailable"
+                    : "No origin-destination flows"
+                }
+                detail={
+                  error
+                    ? OFFLINE_HINT
+                    : "Only vehicles seen at two or more cameras contribute to this matrix."
+                }
+                tone={
+                  error ? "error" : "neutral"
+                }
+              />
+            )}
+
+            {data.flowSeries.length > 0 && (
             <ResponsiveContainer
               width="100%"
               height={280}
             >
               <BarChart
-                data={flowData}
+                data={data.flowSeries}
                 layout="vertical"
                 margin={{
                   top: 10,
@@ -295,6 +614,7 @@ export default function Analytics() {
                 />
               </BarChart>
             </ResponsiveContainer>
+            )}
           </ChartCard>
         </div>
 
@@ -346,37 +666,37 @@ export default function Analytics() {
                 gap: "10px",
               }}
             >
-              <CorridorRow
-                name="Central Corridor"
-                speed="27 km/h"
-                travelTime="18 min"
-                status="Heavy"
-                color="#f97316"
-              />
-
-              <CorridorRow
-                name="ITO Approach"
-                speed="19 km/h"
-                travelTime="24 min"
-                status="Severe"
-                color="#ef4444"
-              />
-
-              <CorridorRow
-                name="Pusa Road"
-                speed="41 km/h"
-                travelTime="11 min"
-                status="Normal"
-                color="#22c55e"
-              />
-
-              <CorridorRow
-                name="Ring Connector"
-                speed="31 km/h"
-                travelTime="15 min"
-                status="Moderate"
-                color="#eab308"
-              />
+              {data.corridors.length === 0 ? (
+                <EmptyState
+                  title={
+                    error
+                      ? "Corridors unavailable"
+                      : "No ranked corridors"
+                  }
+                  detail={
+                    error
+                      ? OFFLINE_HINT
+                      : NO_DATA_HINT
+                  }
+                  tone={
+                    error ? "error" : "neutral"
+                  }
+                />
+              ) : (
+                data.corridors.map(
+                (corridor) => (
+                  <CorridorRow
+                    key={corridor.name}
+                    name={corridor.name}
+                    speed={corridor.speed}
+                    travelTime={
+                      corridor.travelTime
+                    }
+                    status={corridor.status}
+                    color={corridor.color}
+                  />
+                )
+              ))}
             </div>
           </section>
 
@@ -420,17 +740,29 @@ export default function Analytics() {
             >
               <Insight
                 title="Peak movement"
-                text="Central → East is currently the strongest OD flow."
+                text={`${data.topFlowLabel} is the strongest OD flow, at ${data.topFlowCount.toLocaleString()} vehicles.`}
               />
 
               <Insight
                 title="Slowest corridor"
-                text="ITO Approach has the lowest average speed and highest travel delay."
+                text={
+                  data.corridors[0]
+                    ? `${data.corridors[0].name} is the worst corridor, at ${data.corridors[0].travelTime} median travel time.`
+                    : "No corridor had enough samples to rank."
+                }
               />
 
               <Insight
-                title="Traffic trend"
-                text="Average network speed dropped during the 21:00–22:00 interval."
+                title="OD coverage"
+                text={`${
+                  data.coverageFraction !== null
+                    ? `${Math.round(
+                        data.coverageFraction * 100
+                      )}% of observed vehicles`
+                    : "An unreported share of vehicles"
+                } could be used (${data.coverageUsable.toLocaleString()} of ${data.coverageObserved.toLocaleString()}). ${
+                  data.coverageNote
+                }`}
               />
             </div>
           </section>

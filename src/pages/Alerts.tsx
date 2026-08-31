@@ -1,14 +1,33 @@
-import { useMemo, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import Sidebar from "../components/layout/Sidebar";
-
-type Severity =
-  | "critical"
-  | "high"
-  | "medium";
+import ConnectionBadge, {
+  connectionState,
+} from "../components/common/ConnectionBadge";
+import EmptyState, {
+  NO_DATA_HINT,
+  OFFLINE_HINT,
+} from "../components/common/EmptyState";
+import { useApiData } from "../hooks/useApiData";
+import {
+  alertTypeLabel,
+  getAlerts,
+  type AlertSummary,
+  type Severity,
+} from "../services/alertsApi";
+import {
+  connectLiveStream,
+  type AlertEventData,
+} from "../services/liveStream";
 
 type AlertItem = {
   id: string;
+  alertId: number;
   severity: Severity;
   title: string;
   description: string;
@@ -17,101 +36,196 @@ type AlertItem = {
   camera?: string;
   zone?: string;
   confidence?: string;
+  repeatCount: number;
+  isLive: boolean;
 };
 
-const demoAlerts: AlertItem[] = [
-  {
-    id: "A001",
-    severity: "critical",
-    title: "Blacklist Vehicle Detected",
-    description:
-      "Vehicle UP15AB1234 detected at C04 · ITO.",
-    time: "10:42 PM",
-    vehicle: "UP15AB1234",
-    camera: "C04 · ITO",
-    zone: "Central Delhi",
-    confidence: "96%",
-  },
+function formatTime(
+  timestamp: string
+): string {
+  const date = new Date(timestamp);
 
-  {
-    id: "A002",
-    severity: "high",
-    title: "Impossible Speed",
-    description:
-      "Travel time between two camera sightings is below the valid threshold.",
-    time: "10:36 PM",
-    vehicle: "DL8CAF9211",
-    camera: "C07",
-    zone: "Central Delhi",
-    confidence: "91%",
-  },
+  return Number.isNaN(date.getTime())
+    ? timestamp
+    : date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+}
 
-  {
-    id: "A003",
-    severity: "high",
-    title: "Possible Detour",
-    description:
-      "Vehicle path deviated significantly from the expected road route.",
-    time: "10:28 PM",
-    vehicle: "V123",
-    camera: "C02 · India Gate",
-    zone: "Central Delhi",
-    confidence: "82%",
-  },
+function toAlertItem(
+  row: AlertSummary,
+  isLive = false
+): AlertItem {
+  const confidence =
+    row.metadata &&
+    typeof row.metadata.plate_confidence ===
+      "number"
+      ? `${Math.round(
+          row.metadata.plate_confidence * 100
+        )}%`
+      : undefined;
 
-  {
-    id: "A004",
-    severity: "medium",
-    title: "Camera Silent",
-    description:
-      "Camera C08 has stopped reporting recent observations.",
-    time: "10:18 PM",
-    camera: "C08",
-    zone: "West Delhi",
-  },
+  return {
+    id: String(row.alert_id),
+    alertId: row.alert_id,
+    severity: row.severity,
+    title: alertTypeLabel(row.alert_type),
+    description: row.message,
+    time: formatTime(row.occurred_at),
+    vehicle: row.plate ?? undefined,
+    camera: row.camera_name
+      ? `${row.camera_id} · ${row.camera_name}`
+      : row.camera_id ?? undefined,
+    zone: row.zone ?? undefined,
+    confidence,
+    repeatCount: row.repeat_count,
+    isLive,
+  };
+}
 
-  {
-    id: "A005",
-    severity: "medium",
-    title: "Plate Mismatch",
-    description:
-      "Observed plate candidates conflict with the current vehicle identity score.",
-    time: "10:06 PM",
-    vehicle: "HR26DX4821",
-    camera: "C11",
-    zone: "North Delhi",
-    confidence: "69%",
-  },
-];
+/**
+ * The stream payload is deliberately narrower than
+ * an /api/alerts row: it carries no plate, zone or
+ * repeat count. Those are left absent rather than
+ * faked, so a live row never claims to know
+ * something it was not told.
+ */
+function toLiveAlertItem(
+  data: AlertEventData
+): AlertItem {
+  return {
+    id: String(data.alert_id),
+    alertId: data.alert_id,
+    severity: data.severity,
+    title: alertTypeLabel(data.alert_type),
+    description: data.message,
+    time: formatTime(data.occurred_at),
+    camera: data.camera_name
+      ? `${data.camera_id} · ${data.camera_name}`
+      : data.camera_id ?? undefined,
+    repeatCount: 1,
+    isLive: true,
+  };
+}
 
-type AlertFilter =
-  | "all"
-  | Severity;
+type AlertFilter = "all" | Severity;
 
 export default function Alerts() {
   const [filter, setFilter] =
     useState<AlertFilter>("all");
 
   const [selectedAlertId, setSelectedAlertId] =
-    useState("A001");
+    useState<string | null>(null);
+
+  const {
+    data: fetchedAlerts,
+    loading,
+    error,
+    reload,
+  } = useApiData<AlertItem[]>(
+    async (signal) =>
+      (
+        await getAlerts({ limit: 50 }, signal)
+      ).map((row) => toAlertItem(row)),
+    []
+  );
+
+  const fetched = useMemo(
+    () => fetchedAlerts ?? [],
+    [fetchedAlerts]
+  );
+
+  // Alerts arriving on the stream are prepended
+  // so the feed moves without a refetch.
+  const [streamed, setStreamed] = useState<
+    AlertItem[]
+  >([]);
+
+  const [streamOpen, setStreamOpen] =
+    useState(false);
+
+  // A blacklisted vehicle crossing the city fires
+  // alerts in bursts. One refetch per alert would
+  // be a request every few hundred milliseconds
+  // for a list that has barely changed.
+  const lastReloadRef = useRef(0);
+  const REFETCH_THROTTLE_MS = 3000;
+
+  useEffect(() => {
+    const stream = connectLiveStream({
+      onOpen: () => setStreamOpen(true),
+      onError: () => setStreamOpen(false),
+
+      onAlert: (data) => {
+        setStreamed((current) => [
+          toLiveAlertItem(data),
+          ...current,
+        ]);
+
+        // Refetch so the streamed row is replaced
+        // by the full /api/alerts version, which
+        // carries the plate, zone and the repeat
+        // count the stream does not send.
+        const now = Date.now();
+
+        if (
+          now - lastReloadRef.current >
+          REFETCH_THROTTLE_MS
+        ) {
+          lastReloadRef.current = now;
+          reload();
+        }
+      },
+    });
+
+    return () => stream.close();
+  }, [reload]);
+
+  const alerts = useMemo(() => {
+    const seen = new Set<number>();
+
+    return [...streamed, ...fetched].filter(
+      (alert) => {
+        if (seen.has(alert.alertId)) {
+          return false;
+        }
+
+        seen.add(alert.alertId);
+        return true;
+      }
+    );
+  }, [streamed, fetched]);
 
   const filteredAlerts =
     useMemo(() => {
       if (filter === "all") {
-        return demoAlerts;
+        return alerts;
       }
 
-      return demoAlerts.filter(
+      return alerts.filter(
         (alert) =>
           alert.severity === filter
       );
-    }, [filter]);
+    }, [alerts, filter]);
 
   const selectedAlert =
-    demoAlerts.find(
+    alerts.find(
       (alert) =>
         alert.id === selectedAlertId
-    ) ?? demoAlerts[0];
+    ) ?? alerts[0];
+
+  const highCount = alerts.filter(
+    (a) => a.severity === "high"
+  ).length;
+
+  const mediumCount = alerts.filter(
+    (a) => a.severity === "medium"
+  ).length;
+
+  const lowCount = alerts.filter(
+    (a) => a.severity === "low"
+  ).length;
 
   function handleFilterChange(
     value: AlertFilter
@@ -123,7 +237,7 @@ export default function Alerts() {
     }
 
     const firstMatchingAlert =
-      demoAlerts.find(
+      alerts.find(
         (alert) =>
           alert.severity === value
       );
@@ -170,11 +284,30 @@ export default function Alerts() {
           <div>
             <div
               style={{
-                fontSize: "24px",
-                fontWeight: 750,
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
               }}
             >
-              Alerts
+              <div
+                style={{
+                  fontSize: "24px",
+                  fontWeight: 750,
+                }}
+              >
+                Alerts
+              </div>
+
+              <ConnectionBadge
+                state={connectionState({
+                  loading,
+                  error,
+                  stream: streamOpen,
+                })}
+                title={
+                  error ? error.message : undefined
+                }
+              />
             </div>
 
             <div
@@ -211,16 +344,16 @@ export default function Alerts() {
               All alerts
             </option>
 
-            <option value="critical">
-              Critical
-            </option>
-
             <option value="high">
               High
             </option>
 
             <option value="medium">
               Medium
+            </option>
+
+            <option value="low">
+              Low
             </option>
           </select>
         </div>
@@ -238,26 +371,26 @@ export default function Alerts() {
         >
           <AlertKpi
             label="Active Alerts"
-            value="7"
+            value={String(alerts.length)}
             color="#ef4444"
           />
 
           <AlertKpi
-            label="Critical"
-            value="1"
+            label="High"
+            value={String(highCount)}
             color="#dc2626"
           />
 
           <AlertKpi
-            label="High Priority"
-            value="2"
+            label="Medium"
+            value={String(mediumCount)}
             color="#f97316"
           />
 
           <AlertKpi
-            label="Resolved Today"
-            value="18"
-            color="#22c55e"
+            label="Low"
+            value={String(lowCount)}
+            color="#f59e0b"
           />
         </div>
 
@@ -323,7 +456,9 @@ export default function Alerts() {
                   display: "flex",
                   alignItems: "center",
                   gap: "6px",
-                  color: "#4ade80",
+                  color: streamOpen
+                    ? "#4ade80"
+                    : "#64748b",
                   fontSize: "10px",
                   fontWeight: 650,
                 }}
@@ -333,11 +468,15 @@ export default function Alerts() {
                     width: "7px",
                     height: "7px",
                     borderRadius: "50%",
-                    background: "#22c55e",
+                    background: streamOpen
+                      ? "#22c55e"
+                      : "#64748b",
                   }}
                 />
 
-                Demo feed
+                {streamOpen
+                  ? "Streaming"
+                  : "Stream closed"}
               </div>
             </div>
 
@@ -348,14 +487,35 @@ export default function Alerts() {
                 gap: "10px",
               }}
             >
-              {filteredAlerts.map(
+              {filteredAlerts.length === 0 ? (
+                <EmptyState
+                  title={
+                    error
+                      ? "Alert feed unavailable"
+                      : alerts.length === 0
+                      ? "No alerts"
+                      : "No alerts at this severity"
+                  }
+                  detail={
+                    error
+                      ? OFFLINE_HINT
+                      : alerts.length === 0
+                      ? NO_DATA_HINT
+                      : undefined
+                  }
+                  tone={
+                    error ? "error" : "neutral"
+                  }
+                />
+              ) : (
+                filteredAlerts.map(
                 (alert) => (
                   <AlertRow
                     key={alert.id}
                     alert={alert}
                     selected={
                       alert.id ===
-                      selectedAlert.id
+                      selectedAlert?.id
                     }
                     onClick={() =>
                       setSelectedAlertId(
@@ -364,7 +524,7 @@ export default function Alerts() {
                     }
                   />
                 )
-              )}
+              ))}
             </div>
           </section>
 
@@ -391,6 +551,15 @@ export default function Alerts() {
               Selected alert
             </div>
 
+            {!selectedAlert && (
+              <EmptyState
+                title="Nothing selected"
+                detail="Pick an alert from the feed to see the sighting that triggered it."
+              />
+            )}
+
+            {selectedAlert && (
+            <>
             <div
               style={{
                 marginTop: "8px",
@@ -498,6 +667,8 @@ export default function Alerts() {
                 Investigate Vehicle
               </button>
             )}
+            </>
+            )}
           </aside>
         </div>
       </main>
@@ -603,6 +774,23 @@ function AlertRow({
           }}
         >
           {alert.title}
+
+          {alert.repeatCount > 1 && (
+            <span
+              style={{
+                marginLeft: "7px",
+                padding: "1px 6px",
+                borderRadius: "999px",
+                background: "rgba(148,163,184,.16)",
+                color: "#cbd5e1",
+                fontSize: "10px",
+                fontWeight: 700,
+              }}
+              title="Repeat sightings collapsed into one alert"
+            >
+              ×{alert.repeatCount}
+            </span>
+          )}
         </div>
 
         <div
@@ -697,15 +885,11 @@ function SeverityBadge({
 function getSeverityColor(
   severity: Severity
 ) {
-  if (
-    severity === "critical"
-  ) {
+  if (severity === "high") {
     return "#ef4444";
   }
 
-  if (
-    severity === "high"
-  ) {
+  if (severity === "medium") {
     return "#f97316";
   }
 

@@ -2,8 +2,213 @@ import { Link } from "react-router-dom";
 
 import Sidebar from "../components/layout/Sidebar";
 import CityMap from "../components/map/CityMap";
+import ConnectionBadge, {
+  connectionState,
+} from "../components/common/ConnectionBadge";
+import DemoControl from "../components/common/DemoControl";
+import EmptyState, {
+  NO_DATA_HINT,
+  OFFLINE_HINT,
+} from "../components/common/EmptyState";
+import { useApiData } from "../hooks/useApiData";
+import { getSummary } from "../services/analyticsApi";
+import {
+  alertTypeLabel,
+  getAlerts,
+  type Severity,
+} from "../services/alertsApi";
+import { getRecentObservations } from "../services/observationsApi";
+import { getCameras } from "../services/mapApi";
+
+type DashboardAlert = {
+  severity: Severity;
+  title: string;
+  description: string;
+  time: string;
+};
+
+type DashboardSighting = {
+  vehicle: string;
+  camera: string;
+  zone: string;
+  time: string;
+  confidence: string;
+};
+
+type DashboardData = {
+  activeCameras: number;
+  camerasReporting: number;
+  /**
+   * Sightings, not distinct vehicles: the backend's
+   * unique_vehicles is summed over per-camera
+   * buckets, so it counts a vehicle once per camera
+   * per bucket. Labelled accordingly.
+   */
+  sightingCount: number;
+  activeAlerts: number;
+  highAlerts: number;
+  /** Congestion ratio of the worst edge, e.g. "2.09x". */
+  worstRatio: string;
+  worstEdge: string;
+  alerts: DashboardAlert[];
+  sightings: DashboardSighting[];
+};
+
+function clockTime(value: string): string {
+  const date = new Date(value);
+
+  return Number.isNaN(date.getTime())
+    ? value
+    : date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+}
+
+function percent(
+  value: number | null
+): string {
+  return value === null
+    ? "\u2014"
+    : `${Math.round(value * 100)}%`;
+}
+
+// What an empty database looks like. Every number is
+// a real zero, not a placeholder standing in for one.
+const NOTHING_YET: DashboardData = {
+  activeCameras: 0,
+  camerasReporting: 0,
+  sightingCount: 0,
+  activeAlerts: 0,
+  highAlerts: 0,
+  worstRatio: "\u2014",
+  worstEdge: "No corridor ranked yet",
+  alerts: [],
+  sightings: [],
+};
+
+// Live mode: the analytics endpoints default to the
+// last 15 minutes when called with no range, so a
+// poll on that cadence is what "live" means here.
+const REFRESH_MS = 15_000;
 
 export default function Dashboard() {
+  const {
+    data: fetched,
+    loading,
+    error,
+  } = useApiData<DashboardData>(
+      async (signal) => {
+        const [
+          summary,
+          alerts,
+          recent,
+          cameras,
+        ] = await Promise.all([
+          getSummary(
+            undefined,
+            undefined,
+            signal
+          ),
+          getAlerts({ limit: 4 }, signal),
+          getRecentObservations(
+            5,
+            undefined,
+            signal
+          ),
+          getCameras(signal),
+        ]);
+
+        // /api/events/recent carries camera ids
+        // but not names or zones; the camera
+        // response is where those live.
+        const byId = new Map(
+          cameras.features.map((f) => [
+            f.properties.camera_id,
+            f.properties,
+          ])
+        );
+
+        const bySeverity =
+          summary.alerts_by_severity ?? {};
+
+        const activeAlerts = Object.values(
+          bySeverity
+        ).reduce((a, b) => a + b, 0);
+
+        const worst =
+          summary.worst_congested_edge;
+
+        return {
+          activeCameras:
+            cameras.features.filter(
+              (f) => f.properties.is_active
+            ).length,
+          camerasReporting:
+            summary.active_cameras_reporting,
+          sightingCount:
+            summary.total_observations,
+          activeAlerts,
+          highAlerts: bySeverity.high ?? 0,
+          // The count of severe corridors was a poor
+          // headline: a city with one badly congested
+          // corridor and none at "severe" showed a
+          // zero. The ratio is the number that
+          // actually says how bad the worst one is.
+          worstRatio:
+            worst?.congestion_ratio != null
+              ? `${worst.congestion_ratio.toFixed(2)}\u00d7`
+              : "\u2014",
+          worstEdge: worst
+            ? `${worst.from_camera_id} \u2192 ${worst.to_camera_id} \u00b7 ${
+                worst.congestion_band ?? "unbanded"
+              }`
+            : "No corridor ranked yet",
+
+          alerts: alerts.map((row) => ({
+            severity: row.severity,
+            title: alertTypeLabel(
+              row.alert_type
+            ),
+            description: row.message,
+            time: clockTime(row.occurred_at),
+          })),
+
+          sightings: recent.map((row) => {
+            const camera = byId.get(
+              row.camera_id
+            );
+
+            return {
+              vehicle:
+                row.plate_text ?? "unreadable",
+              camera: camera
+                ? `${row.camera_id} \u00b7 ${camera.name}`
+                : row.camera_id,
+              zone: camera?.zone ?? "\u2014",
+              time: clockTime(
+                row.first_seen_at
+              ),
+              confidence: percent(
+                row.plate_confidence
+              ),
+            };
+          }),
+        };
+      },
+      [],
+      { refreshMs: REFRESH_MS }
+    );
+
+  // The page renders zeros rather than blanking
+  // while the first load is in flight.
+  const data = fetched ?? NOTHING_YET;
+
+  const hasData =
+    fetched !== null &&
+    (fetched.sightingCount > 0 ||
+      fetched.activeCameras > 0);
+
   return (
     <div
       style={{
@@ -41,9 +246,24 @@ export default function Dashboard() {
               style={{
                 fontSize: "24px",
                 fontWeight: 750,
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
               }}
             >
               Live Operations Dashboard
+
+              <ConnectionBadge
+                state={connectionState({
+                  loading,
+                  error,
+                })}
+                title={
+                  error
+                    ? error.message
+                    : undefined
+                }
+              />
             </div>
 
             <div
@@ -115,6 +335,8 @@ export default function Dashboard() {
           </div>
         </div>
 
+        <DemoControl />
+
         {/* KPI CARDS */}
 
         <div
@@ -128,27 +350,27 @@ export default function Dashboard() {
         >
           <KpiCard
             label="Active Cameras"
-            value="24"
-            detail="21 currently online"
+            value={String(data.activeCameras)}
+            detail={`${data.camerasReporting} reporting`}
           />
 
           <KpiCard
-            label="Vehicles Detected"
-            value="1,482"
+            label="Vehicle Sightings"
+            value={data.sightingCount.toLocaleString()}
             detail="Within last 15 min"
           />
 
           <KpiCard
             label="Active Alerts"
-            value="7"
-            detail="2 high priority"
+            value={String(data.activeAlerts)}
+            detail={`${data.highAlerts} high priority`}
             accent="#ef4444"
           />
 
           <KpiCard
-            label="Severe Roads"
-            value="4"
-            detail="Current congestion"
+            label="Worst Corridor"
+            value={data.worstRatio}
+            detail={data.worstEdge}
             accent="#f97316"
           />
         </div>
@@ -253,33 +475,38 @@ export default function Dashboard() {
                 gap: "9px",
               }}
             >
-              <AlertCard
-                severity="high"
-                title="Possible Detour"
-                description="Vehicle V123 deviated from expected camera path."
-                time="2 min ago"
-              />
-
-              <AlertCard
-                severity="medium"
-                title="Camera Silent"
-                description="Camera C08 has stopped reporting recent sightings."
-                time="8 min ago"
-              />
-
-              <AlertCard
-                severity="low"
-                title="Congestion Increase"
-                description="Traffic density is rising near Central Corridor."
-                time="11 min ago"
-              />
-
-              <AlertCard
-                severity="high"
-                title="Low Confidence Link"
-                description="Trajectory hop confidence dropped below threshold."
-                time="13 min ago"
-              />
+              {data.alerts.length === 0 ? (
+                <EmptyState
+                  title={
+                    error
+                      ? "Alerts unavailable"
+                      : "No alerts"
+                  }
+                  detail={
+                    error
+                      ? OFFLINE_HINT
+                      : hasData
+                      ? "Nothing has fired in this window."
+                      : NO_DATA_HINT
+                  }
+                  tone={
+                    error ? "error" : "neutral"
+                  }
+                />
+              ) : (
+                data.alerts.map(
+                (alert, index) => (
+                  <AlertCard
+                    key={index}
+                    severity={alert.severity}
+                    title={alert.title}
+                    description={
+                      alert.description
+                    }
+                    time={alert.time}
+                  />
+                )
+              ))}
             </div>
           </aside>
         </div>
@@ -358,29 +585,33 @@ export default function Dashboard() {
             <div>Confidence</div>
           </div>
 
-          <SightingRow
-            vehicle="UP15AB1234"
-            camera="C04 · ITO"
-            zone="Central Delhi"
-            time="10:42 PM"
-            confidence="96%"
-          />
-
-          <SightingRow
-            vehicle="DL8CAF9211"
-            camera="C01 · Connaught Place"
-            zone="Central Delhi"
-            time="10:39 PM"
-            confidence="93%"
-          />
-
-          <SightingRow
-            vehicle="HR26DX4821"
-            camera="C03 · Karol Bagh"
-            zone="West Delhi"
-            time="10:34 PM"
-            confidence="89%"
-          />
+          {data.sightings.length === 0 ? (
+            <EmptyState
+              title={
+                error
+                  ? "Sightings unavailable"
+                  : "No sightings yet"
+              }
+              detail={
+                error ? OFFLINE_HINT : NO_DATA_HINT
+              }
+              tone={error ? "error" : "neutral"}
+            />
+          ) : (
+            data.sightings.map(
+            (sighting, index) => (
+              <SightingRow
+                key={index}
+                vehicle={sighting.vehicle}
+                camera={sighting.camera}
+                zone={sighting.zone}
+                time={sighting.time}
+                confidence={
+                  sighting.confidence
+                }
+              />
+            )
+          ))}
         </section>
       </main>
     </div>

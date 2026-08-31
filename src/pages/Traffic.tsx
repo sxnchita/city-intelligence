@@ -1,7 +1,68 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
 import Sidebar from "../components/layout/Sidebar";
 import CityMap from "../components/map/CityMap";
+import ConnectionBadge, {
+  connectionState,
+} from "../components/common/ConnectionBadge";
+import EmptyState, {
+  NO_DATA_HINT,
+  OFFLINE_HINT,
+} from "../components/common/EmptyState";
+import { useApiData } from "../hooks/useApiData";
+import {
+  getCongestion,
+  type CongestionResponse,
+} from "../services/analyticsApi";
+import type { CongestionBand } from "../services/mapApi";
+
+const BAND_COLOR: Record<
+  CongestionBand,
+  string
+> = {
+  free: "#22c55e",
+  moderate: "#eab308",
+  heavy: "#f97316",
+  severe: "#ef4444",
+};
+
+const BAND_LABEL: Record<
+  CongestionBand,
+  string
+> = {
+  free: "Free flowing",
+  moderate: "Moderate",
+  heavy: "Heavy",
+  severe: "Severe",
+};
+
+// An empty window is a real answer, so the page has
+// a shape to render for it rather than a fixture.
+const NOTHING_YET: CongestionResponse = {
+  from: "",
+  to: "",
+  min_samples: 0,
+  excluded_low_sample_edges: 0,
+  rows: [],
+};
+
+// Live mode polls; the backend defaults to the last
+// 15 minutes when called with no range.
+const REFRESH_MS = 15_000;
+
+function edgeLabel(row: {
+  from_camera_name: string | null;
+  from_camera_id: string;
+  to_camera_name: string | null;
+  to_camera_id: string;
+}): string {
+  const from =
+    row.from_camera_name ?? row.from_camera_id;
+  const to =
+    row.to_camera_name ?? row.to_camera_id;
+
+  return `${from} \u2192 ${to}`;
+}
 
 type TimeRange =
   | "live"
@@ -18,6 +79,98 @@ export default function Traffic() {
 
   const [customTo, setCustomTo] =
     useState("");
+
+  // The range is resolved inside the fetcher
+  // rather than during render: Date.now() is
+  // impure, and the fetcher runs in an effect.
+  // Resolved once per render so the same window
+  // drives both the table and the map's heatmap.
+  const [mapWindow, setMapWindow] = useState<{
+    from?: string;
+    to?: string;
+  }>({});
+
+  const {
+    data: fetched,
+    loading,
+    error,
+  } = useApiData<CongestionResponse>(
+    (signal) => {
+      const now = Date.now();
+
+      // "live" sends no range at all — the
+      // backend defaults to the last 15 minutes,
+      // which is exactly what live mode means.
+      let from: string | undefined;
+      let to: string | undefined;
+
+      if (selectedRange === "hour") {
+        from = new Date(
+          now - 60 * 60 * 1000
+        ).toISOString();
+        to = new Date(now).toISOString();
+      } else if (selectedRange === "today") {
+        const start = new Date(now);
+        start.setHours(0, 0, 0, 0);
+
+        from = start.toISOString();
+        to = new Date(now).toISOString();
+      } else if (selectedRange === "custom") {
+        from = customFrom
+          ? new Date(customFrom).toISOString()
+          : undefined;
+        to = customTo
+          ? new Date(customTo).toISOString()
+          : undefined;
+      }
+
+      setMapWindow({ from, to });
+
+      return getCongestion(
+        from,
+        to,
+        20,
+        signal
+      );
+    },
+    [selectedRange, customFrom, customTo],
+    {
+      // Only live mode keeps moving. A fixed range
+      // returns the same rows every time, so polling
+      // it is pure noise.
+      refreshMs:
+        selectedRange === "live"
+          ? REFRESH_MS
+          : undefined,
+    }
+  );
+
+  const congestion = fetched ?? NOTHING_YET;
+
+  const bandCounts = useMemo(() => {
+    const counts: Record<
+      CongestionBand,
+      number
+    > = {
+      free: 0,
+      moderate: 0,
+      heavy: 0,
+      severe: 0,
+    };
+
+    for (const row of congestion.rows) {
+      if (row.congestion_band) {
+        counts[row.congestion_band] += 1;
+      }
+    }
+
+    return counts;
+  }, [congestion]);
+
+  const rankedRows = useMemo(
+    () => congestion.rows.slice(0, 3),
+    [congestion]
+  );
 
   const rangeLabel =
     selectedRange === "live"
@@ -65,9 +218,22 @@ export default function Traffic() {
               style={{
                 fontSize: "24px",
                 fontWeight: 750,
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
               }}
             >
               Traffic Intelligence
+
+              <ConnectionBadge
+                state={connectionState({
+                  loading,
+                  error,
+                })}
+                title={
+                  error ? error.message : undefined
+                }
+              />
             </div>
 
             <div
@@ -316,29 +482,33 @@ export default function Traffic() {
         >
           <TrafficKpi
             label="Road Segments"
-            value="84"
-            detail="Currently monitored"
+            value={String(
+              congestion.rows.length
+            )}
+            detail="Ranked this window"
           />
 
           <TrafficKpi
             label="Heavy Traffic"
-            value="11"
+            value={String(bandCounts.heavy)}
             detail="Road segments"
             color="#f97316"
           />
 
           <TrafficKpi
             label="Severe Traffic"
-            value="4"
+            value={String(bandCounts.severe)}
             detail="Needs attention"
             color="#ef4444"
           />
 
           <TrafficKpi
-            label="Avg Network Speed"
-            value="32 km/h"
-            detail={rangeLabel}
-            color="#38bdf8"
+            label="Excluded"
+            value={String(
+              congestion.excluded_low_sample_edges
+            )}
+            detail={`Under ${congestion.min_samples} samples`}
+            color="#94a3b8"
           />
         </div>
 
@@ -370,6 +540,8 @@ export default function Traffic() {
               showCamerasInitially={true}
               showTrajectoryInitially={false}
               showTrafficInitially={true}
+              from={mapWindow.from}
+              to={mapWindow.to}
             />
           </section>
 
@@ -408,33 +580,30 @@ export default function Traffic() {
               </div>
             </div>
 
-            <CongestionRow
-              label="Normal"
-              value="52"
-              percentage={62}
-              color="#22c55e"
-            />
+            {(
+              [
+                "free",
+                "moderate",
+                "heavy",
+                "severe",
+              ] as CongestionBand[]
+            ).map((band) => {
+              const count = bandCounts[band];
+              const total =
+                congestion.rows.length || 1;
 
-            <CongestionRow
-              label="Moderate"
-              value="17"
-              percentage={20}
-              color="#eab308"
-            />
-
-            <CongestionRow
-              label="Heavy"
-              value="11"
-              percentage={13}
-              color="#f97316"
-            />
-
-            <CongestionRow
-              label="Severe"
-              value="4"
-              percentage={5}
-              color="#ef4444"
-            />
+              return (
+                <CongestionRow
+                  key={band}
+                  label={BAND_LABEL[band]}
+                  value={String(count)}
+                  percentage={Math.round(
+                    (count / total) * 100
+                  )}
+                  color={BAND_COLOR[band]}
+                />
+              );
+            })}
 
             <div
               style={{
@@ -472,32 +641,57 @@ export default function Traffic() {
                   gap: "9px",
                 }}
               >
-                <RoadCard
-                  rank={1}
-                  road="ITO Approach"
-                  band="Severe"
-                  score="0.96"
-                  samples="260"
-                  color="#ef4444"
-                />
-
-                <RoadCard
-                  rank={2}
-                  road="Ring Connector"
-                  band="Heavy"
-                  score="0.78"
-                  samples="210"
-                  color="#f97316"
-                />
-
-                <RoadCard
-                  rank={3}
-                  road="Central Corridor"
-                  band="Moderate"
-                  score="0.55"
-                  samples="175"
-                  color="#eab308"
-                />
+                {rankedRows.length === 0 ? (
+                  <EmptyState
+                    title={
+                      error
+                        ? "Congestion unavailable"
+                        : "No ranked corridors"
+                    }
+                    detail={
+                      error
+                        ? OFFLINE_HINT
+                        : NO_DATA_HINT
+                    }
+                    tone={
+                      error ? "error" : "neutral"
+                    }
+                  />
+                ) : (
+                  rankedRows.map(
+                  (row, index) => (
+                    <RoadCard
+                      key={row.edge_id}
+                      rank={index + 1}
+                      road={edgeLabel(row)}
+                      band={
+                        row.congestion_band
+                          ? BAND_LABEL[
+                              row.congestion_band
+                            ]
+                          : "Unbanded"
+                      }
+                      score={
+                        row.congestion_ratio !==
+                        null
+                          ? row.congestion_ratio.toFixed(
+                              2
+                            )
+                          : "\u2014"
+                      }
+                      samples={String(
+                        row.sample_count
+                      )}
+                      color={
+                        row.congestion_band
+                          ? BAND_COLOR[
+                              row.congestion_band
+                            ]
+                          : "#94a3b8"
+                      }
+                    />
+                  )
+                ))}
               </div>
             </div>
 
