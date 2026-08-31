@@ -1,6 +1,6 @@
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ||
-  "http://localhost:8000";
+  "";
 
 // =====================================
 // GEOJSON TYPES
@@ -142,7 +142,7 @@ export type TrafficCollection =
 
 export async function getCameras(): Promise<CameraCollection> {
   const response = await fetch(
-    `${API_BASE_URL}/api/v1/cameras`
+    `${API_BASE_URL}/api/cameras`
   );
 
   if (!response.ok) {
@@ -211,7 +211,7 @@ export async function getTrafficHeatmap(
   params.set("to", to);
 
   const response = await fetch(
-    `${API_BASE_URL}/api/v1/analytics/heatmap?${params.toString()}`
+    `${API_BASE_URL}/api/analytics/heatmap?${params.toString()}`
   );
 
   if (!response.ok) {
