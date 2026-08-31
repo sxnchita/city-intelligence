@@ -802,6 +802,24 @@ export default function CityMap({
         "new_sighting"
       ) {
         loadTrajectory();
+
+        if (event.data.latitude && event.data.longitude) {
+          const latlng: [number, number] = [
+            event.data.latitude,
+            event.data.longitude,
+          ];
+          if (liveMarkerRef.current) {
+            liveMarkerRef.current.setLatLng(latlng);
+          } else if (mapRef.current) {
+            liveMarkerRef.current = L.marker(latlng, {
+              icon: pulsingIcon,
+              zIndexOffset: 2000,
+            }).addTo(mapRef.current);
+          }
+          setLiveLabel(
+            `${event.data.vehicle_id} · Camera ${event.data.camera_id}`
+          );
+        }
       }
 
       if (
